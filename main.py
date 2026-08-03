@@ -378,15 +378,12 @@ def find_chrome_executable():
         ]
     elif sys.platform == "win32":
         candidates = [
-            # 新增：程序同级chrome文件夹内的chrome.exe（适配你截图目录结构）
-            os.path.abspath(os.path.join(os.getcwd(), "chrome", "chrome.exe")),
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+            os.path.abspath(r".\chrome\chrome.exe"),
         ]
     else:
         candidates = [
-            os.path.abspath(os.path.join(os.getcwd(), "chrome", "chrome")),
             "/usr/bin/google-chrome",
             "/usr/bin/chromium-browser",
             "/usr/bin/chromium",
@@ -406,9 +403,10 @@ def ensure_chrome_debugging() -> bool:
     if not chrome_path:
         log_print("[!] 未找到 Chrome，请手动启动：")
         if sys.platform == "darwin":
-            log_print(r'    /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --disable-blink-features=AutomationControlled')
+            log_print(r'    /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222')
         elif sys.platform == "win32":
-            log_print(r'    "chrome\chrome.exe" --remote-debugging-port=9222 --disable-blink-features=AutomationControlled')
+            log_print(r'    "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222')
+            log_print(r'    .\chrome\chrome.exe --remote-debugging-port=9222')
         return False
 
     log_print(f"[*] 尝试启动 Chrome（调试端口 {DEBUG_PORT}）...")
@@ -421,13 +419,6 @@ def ensure_chrome_debugging() -> bool:
         f"--user-data-dir={user_data_dir}",
         "--no-first-run",
         "--no-default-browser-check",
-        # 防检测核心启动参数
-        "--disable-blink-features=AutomationControlled",
-        "--exclude-switches=enable-automation",
-        "--disable-automation",
-        "--no-service-autorun",
-        "--password-store=basic",
-        "--disable-notifications",
     ]
     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -950,32 +941,16 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
         log_print("[*] 正在通过 CDP 连接到 Chrome...")
         browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{DEBUG_PORT}")
 
-        # 【推荐】新建独立上下文，不要复用浏览器默认上下文，隔离更好
-        context = browser.new_context()
+        if len(browser.contexts) == 0:
+            log_print("[!] 未找到浏览器上下文")
+            return
 
-        # 完善防检测初始化脚本（更强指纹隐藏）
-        anti_detect_script = """
-            // 移除webdriver标记
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
-            // 补齐chrome对象
-            window.chrome = { runtime: {} };
-            // 模拟正常浏览器插件列表
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [1,2,3,4,5]
-            });
-            // 语言头抹平
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ["zh-CN","zh","en-US","en"]
-            });
-            """
-        context.add_init_script(anti_detect_script)
+        context = browser.contexts[0]
+        log_print(f"[*] 已连接，当前有 {len(context.pages)} 个标签页")
 
         page = context.new_page()
         log_print(f"[*] 访问: {TARGET_URL}")
-        # 修改等待策略，视网站需求调整
-        page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
+        page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
         safe_sleep(3)
         check_stop()
 
