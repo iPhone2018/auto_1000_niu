@@ -370,35 +370,75 @@ def is_port_open(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def find_local_chrome_path() -> str | None:
-    """只定位程序同级chrome文件夹内便携Chrome，不搜索系统Chrome"""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    local_chrome_exe = os.path.join(script_dir, "chrome", "chrome.exe")
-    if os.path.isfile(local_chrome_exe):
-        return f'"{local_chrome_exe}"'
+def find_chrome_executable():
+    if sys.platform == "darwin":
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+        ]
+    elif sys.platform == "win32":
+        candidates = [
+            # 新增：程序同级chrome文件夹内的chrome.exe（适配你截图目录结构）
+            os.path.abspath(os.path.join(os.getcwd(), "chrome", "chrome.exe")),
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        ]
+    else:
+        candidates = [
+            os.path.abspath(os.path.join(os.getcwd(), "chrome", "chrome")),
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+        ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
     return None
 
 
 def ensure_chrome_debugging() -> bool:
     if is_port_open(DEBUG_PORT):
-        log_print(f"[*] 检测到 Chrome 调试端口 {DEBUG_PORT} 已开启，直接复用")
+        log_print(f"[*] 检测到 Chrome 调试端口 {DEBUG_PORT} 已开启")
         return True
 
-    # 端口没打开，提示用户手动启动，不再自动拉起浏览器！
-    log_print(f"[!] 未检测到 Chrome 调试端口 {DEBUG_PORT}")
-    chrome_exe = find_local_chrome_path()
-    if chrome_exe:
-        # 推荐使用本地便携Chrome的启动命令
-        cmd_str = f"{chrome_exe} --remote-debugging-port={DEBUG_PORT}"
-        log_print("[*] 请复制下面命令，打开CMD手动执行启动浏览器：")
-        log_print(f"    {cmd_str}")
-    else:
-        # 找不到本地便携包时备用方案
-        log_print("[*] 未找到目录内便携Chrome，请使用已安装Chrome执行：")
-        if sys.platform == "win32":
-            log_print(r'    "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222')
+    chrome_path = find_chrome_executable()
+    if not chrome_path:
+        log_print("[!] 未找到 Chrome，请手动启动：")
+        if sys.platform == "darwin":
+            log_print(r'    /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --disable-blink-features=AutomationControlled')
+        elif sys.platform == "win32":
+            log_print(r'    "chrome\chrome.exe" --remote-debugging-port=9222 --disable-blink-features=AutomationControlled')
+        return False
 
-    log_print("[*] 浏览器启动完成后，重新运行本程序！")
+    log_print(f"[*] 尝试启动 Chrome（调试端口 {DEBUG_PORT}）...")
+    user_data_dir = os.path.expanduser("~/playwright_chrome_profile")
+    os.makedirs(user_data_dir, exist_ok=True)
+
+    cmd = [
+        chrome_path,
+        f"--remote-debugging-port={DEBUG_PORT}",
+        f"--user-data-dir={user_data_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        # 防检测核心启动参数
+        "--disable-blink-features=AutomationControlled",
+        "--exclude-switches=enable-automation",
+        "--disable-automation",
+        "--no-service-autorun",
+        "--password-store=basic",
+        "--disable-notifications",
+    ]
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    for i in range(10):
+        safe_sleep(1)
+        if is_port_open(DEBUG_PORT):
+            log_print("[+] Chrome 启动成功")
+            return True
+        log_print(f"    等待 Chrome 就绪... ({i + 1}/10)")
+
+    log_print("[!] Chrome 启动后端口未就绪")
     return False
 
 
@@ -910,16 +950,32 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
         log_print("[*] 正在通过 CDP 连接到 Chrome...")
         browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{DEBUG_PORT}")
 
-        if len(browser.contexts) == 0:
-            log_print("[!] 未找到浏览器上下文")
-            return
+        # 【推荐】新建独立上下文，不要复用浏览器默认上下文，隔离更好
+        context = browser.new_context()
 
-        context = browser.contexts[0]
-        log_print(f"[*] 已连接，当前有 {len(context.pages)} 个标签页")
+        # 完善防检测初始化脚本（更强指纹隐藏）
+        anti_detect_script = """
+            // 移除webdriver标记
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+            // 补齐chrome对象
+            window.chrome = { runtime: {} };
+            // 模拟正常浏览器插件列表
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1,2,3,4,5]
+            });
+            // 语言头抹平
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ["zh-CN","zh","en-US","en"]
+            });
+            """
+        context.add_init_script(anti_detect_script)
 
         page = context.new_page()
         log_print(f"[*] 访问: {TARGET_URL}")
-        page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
+        # 修改等待策略，视网站需求调整
+        page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
         safe_sleep(3)
         check_stop()
 
