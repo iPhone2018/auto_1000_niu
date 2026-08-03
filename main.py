@@ -10,6 +10,7 @@ import re
 import requests
 import threading
 import tkinter as tk
+import shutil
 from tkinter import ttk, scrolledtext, messagebox
 from datetime import datetime, timedelta
 from queue import Queue, Empty
@@ -369,26 +370,32 @@ def is_port_open(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def find_chrome_executable():
-    if sys.platform == "darwin":
-        candidates = [
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
-        ]
-    elif sys.platform == "win32":
+def find_chrome_executable() -> str | None:
+    # ========== 新增：优先读取同级chrome文件夹内的chrome.exe（适配你的目录） ==========
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    local_chrome_exe = os.path.join(script_dir, "chrome", "chrome.exe")
+    if os.path.isfile(local_chrome_exe):
+        return local_chrome_exe
+
+    # ========== 下面保留你原有find_chrome_executable系统查找逻辑 ==========
+    if sys.platform == "win32":
         candidates = [
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
         ]
-    else:
-        candidates = [
-            "/usr/bin/google-chrome",
-            "/usr/bin/chromium-browser",
-            "/usr/bin/chromium",
-        ]
-    for path in candidates:
-        if os.path.exists(path):
-            return path
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+    elif sys.platform == "darwin":
+        mac_chrome = r"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        if os.path.exists(mac_chrome):
+            return mac_chrome
+    elif sys.platform.startswith("linux"):
+        for exe in ["google-chrome", "chromium", "chromium-browser"]:
+            chrome_path = shutil.which(exe)
+            if chrome_path:
+                return chrome_path
     return None
 
 
@@ -403,10 +410,10 @@ def ensure_chrome_debugging() -> bool:
         if sys.platform == "darwin":
             log_print(r'    /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222')
         elif sys.platform == "win32":
-            log_print(r'    "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222')
+            log_print(r'    双击目录内 chrome\chrome.exe，附加参数 --remote-debugging-port=9222')
         return False
 
-    log_print(f"[*] 尝试启动 Chrome（调试端口 {DEBUG_PORT}）...")
+    log_print(f"[*] 尝试启动 Chrome（调试端口 {DEBUG_PORT}）PATH: {chrome_path}")
     user_data_dir = os.path.expanduser("~/playwright_chrome_profile")
     os.makedirs(user_data_dir, exist_ok=True)
 
@@ -416,8 +423,20 @@ def ensure_chrome_debugging() -> bool:
         f"--user-data-dir={user_data_dir}",
         "--no-first-run",
         "--no-default-browser-check",
+        # Win10便携版建议增加，规避沙箱报错
+        "--no-sandbox",
     ]
-    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # CREATE_NO_WINDOW 隐藏cmd黑窗口（Windows专属优化）
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = subprocess.CREATE_NO_WINDOW
+
+    subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags
+    )
 
     for i in range(10):
         safe_sleep(1)
