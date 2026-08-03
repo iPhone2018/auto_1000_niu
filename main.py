@@ -961,11 +961,11 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
         if logged:
             log_print(f"[+] 检测到已是登录状态！({reason})")
         else:
-            log_print(f"[*] 未登录，开始自动填充... ({reason})")
+            log_print(f"[*] 未登录，开始自动填充账号密码... ({reason})")
 
             login_frame, source = find_login_frame(page)
             if not login_frame:
-                log_print("[!] 未找到登录框")
+                log_print("[!] 未找到登录框，终止登录流程")
                 return
 
             log_print(f"[+] 找到登录框: {source}")
@@ -975,7 +975,7 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
                 if tab.count() > 0 and tab.is_visible():
                     tab.click()
                     safe_sleep(1)
-                    log_print("[+] 已切换到密码登录")
+                    log_print("[+] 已切换到密码登录方式")
             except Exception:
                 pass
 
@@ -989,42 +989,47 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
             safe_sleep(1)
             check_stop()
 
-            log_print("[*] 点击登录...")
+            log_print("[*] 点击登录按钮...")
             login_frame.click(".fm-submit.password-login")
             safe_sleep(3)
             check_stop()
 
-            log_print("\n" + "=" * 55)
-            log_print("  请在浏览器窗口中完成验证码")
-            log_print(f"  脚本将自动检测登录状态，最长等待 {MAX_WAIT} 秒")
-            log_print("=" * 55 + "\n")
+            log_print("\n" + "=" * 65)
+            log_print("  ⚠️ 重要：请手动依次完成【滑块验证 + 短信验证码】全部校验！")
+            log_print(f"  持续监测登录状态，最长总等待时长 {MAX_WAIT} 秒")
+            log_print("=" * 65 + "\n")
 
             logged_in = False
-            start = time.time()
-            last_reason = ""
-            while time.time() - start < MAX_WAIT:
+            start_time = time.time()
+            last_tip = ""
+            # 持续循环等待，支持多层验证码
+            while time.time() - start_time < MAX_WAIT:
                 check_stop()
-                is_ok, reason = is_logged_in(page)
-                if is_ok:
-                    log_print(f"[+] 登录成功！({reason})")
+                is_login_success, msg = is_logged_in(page)
+                if is_login_success:
+                    log_print(f"\n[+] ✅ 全部验证完成，登录成功！({msg})")
                     logged_in = True
+                    # 登录成功额外等待页面完全加载，保证Cookie完整
+                    log_print("[*] 等待工作台页面加载完成...")
+                    safe_sleep(4)
                     break
-                if reason != last_reason:
-                    log_print(f"    [检测中] {reason}")
-                    last_reason = reason
+
+                # 提示信息变化才打印，减少刷屏
+                if msg != last_tip:
+                    log_print(f"    [等待验证] {msg}")
+                    last_tip = msg
+
+                elapsed_sec = int(time.time() - start_time)
+                if elapsed_sec % 10 == 0:
+                    log_print(f"    已等待 {elapsed_sec} / {MAX_WAIT} 秒，请完成滑块、短信验证码")
                 safe_sleep(2)
-                elapsed = int(time.time() - start)
-                if elapsed % 10 == 0:
-                    log_print(f"    已等待 {elapsed} 秒...")
 
             if not logged_in:
-                log_print("[!] 等待超时")
-                log_print(f"[*] 当前 URL: {page.url}")
-                log_print(f"[*] 当前标题: {page.title()}")
-                log_print(f"[*] 是否仍存在登录框: {is_still_on_login_page(page)}")
-
-            safe_sleep(2)
-            check_stop()
+                log_print("\n[!] ❌ 登录等待超时！请检查是否完成全部验证")
+                log_print(f"[*] 当前页面URL: {page.url}")
+                log_print(f"[*] 当前页面标题: {page.title()}")
+                log_print(f"[*] 是否仍然存在登录框: {is_still_on_login_page(page)}")
+                return
 
         cookies = context.cookies()
         unique_cookies = get_unique_cookies(cookies)
