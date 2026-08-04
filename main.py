@@ -555,7 +555,7 @@ def parse_refund_address(addr_str: str, session: requests.Session) -> dict:
 
 # ==================== 淘宝订单与地址接口 ====================
 
-def query_order_by_tid(session: requests.Session, tid: int):
+def query_order_by_tid(session: requests.Session, tids: str):
     url = "https://trade.taobao.com/trade/itemlist/asyncSold.htm"
     params = {"event_submit_do_query": "1", "_input_charset": "utf8"}
 
@@ -567,14 +567,13 @@ def query_order_by_tid(session: requests.Session, tid: int):
         "action": "itemlist/SoldQueryAction",
         "close": "0",
         "pageNum": "1",
-        "tabCode": "haveSendGoods",
+        "tabCode": "latest3Months",
         "useCheckcode": "false",
         "errorCheckcode": "false",
         "payDateBegin": "0",
         "rateStatus": "ALL",
-        "unionSearch": str(tid),
         "buyerNick": "",
-        "orderStatus": "SEND",
+        "orderStatus": "",
         "pageSize": "15",
         "dateEnd": "0",
         "endTimeBegin": "0",
@@ -589,28 +588,25 @@ def query_order_by_tid(session: requests.Session, tid: int):
         "notifySendGoodsType": "ALL",
         "sellerMemoFlag": "0",
         "useOrderInfo": "false",
-        "logisticsService": "ALL",
+        "logisticsService": "",
         "o2oDeliveryType": "ALL",
         "rxAuditFlag": "0",
-        "auctionId": "",
         "queryOrder": "desc",
         "holdStatus": "0",
         "rxElectronicAuditFlag": "0",
-        "bizOrderId": "",
         "queryMore": "false",
         "payDateEnd": "0",
         "rxWaitSendflag": "0",
         "sellerMemo": "0",
-        "queryBizType": "ALL",
         "rxElectronicAllFlag": "0",
         "rxSuccessflag": "0",
         "unionSearchTotalNum": "0",
-        "yushouStatus": "ALL",
-        "deliveryTimeType": "ALL",
-        "payMethodType": "ALL",
-        "orderType": "ALL",
-        "appName": "ALL",
-        "isRiskOrder": "0",
+        "refund": "",
+        "unionSearchPageNum": "",
+        "bizOrderId": tids,
+        "auctionId": "",
+        "batchType": "bizOrderId",
+        "isBatchSearch": "true"
     }
 
     try:
@@ -621,7 +617,7 @@ def query_order_by_tid(session: requests.Session, tid: int):
             headers=TB_API_HEADERS,
             timeout=30,
         )
-        safe_sleep(0.5)
+        safe_sleep(2)
         check_stop()
     except Exception as e:
         log_print(f"    [!] 请求订单接口异常: {e}")
@@ -637,10 +633,8 @@ def query_order_by_tid(session: requests.Session, tid: int):
         log_print(f"    [!] 订单接口 JSON 解析失败: {e}")
         return None
 
-    orders = result.get("mainOrders", [])
-    if not orders:
-        return None
-    return orders[0]
+    log_print(f"    [+] 订单接口传入条数： {len(tids.split(','))} 返回数据条数: {len(result.get('mainOrders', []))}")
+    return result
 
 
 def get_address_list(session: requests.Session) -> list:
@@ -1073,119 +1067,136 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
     ORDERS = final_result
     total = len(ORDERS)
     success_count = 0
-    skip_count = 0
     fail_count = 0
-
-    for idx, order in enumerate(ORDERS, 1):
+    wait_orders = []
+    res_orders = []
+    for idx, order in enumerate(ORDERS):
         check_stop()
         tid = order["tid"]
-        refund_address = order["refund_address"]
 
         if str(tid) in filtered_tids:
             log_print(f"\n{'=' * 70}")
             log_print(f"[{idx}/{total}] 订单 tid={tid} 已在历史记录中，跳过")
-            skip_count += 1
             continue
 
         log_print(f"\n{'=' * 70}")
         log_print(f"[{idx}/{total}] 处理订单 tid={tid}")
-
-        log_print("    [*] 正在查询订单...")
-        order_info = query_order_by_tid(session, tid)
-        if not order_info:
-            log_print("    [!] 未查询到订单，跳过")
-            skip_count += 1
-            continue
-
-        sub_orders = order_info.get("subOrders", [])
-        for sub_order in sub_orders:
+        wait_orders.append(order)
+        if len(wait_orders) == 15:
+            tids = [str(order["tid"]) for order in wait_orders]
+            tids_str = ",".join(tids)
+            log_print("    [*] 正在批量查询订单...")
+            order_info = query_order_by_tid(session, tids_str)
+            wait_orders = []
+            if order_info:
+                res_orders.extend(order_info.get("mainOrders", []))
+    if wait_orders:
+        tids = [str(order["tid"]) for order in wait_orders]
+        tids_str = ",".join(tids)
+        log_print("    [*] 批量查询订单...")
+        order_info = query_order_by_tid(session, tids_str)
+        wait_orders = []
+        if order_info:
+            res_orders.extend(order_info.get("mainOrders", []))
+    for idx, order in enumerate(ORDERS):
+        check_stop()
+        tid = order["tid"]
+        refund_address = order["refund_address"]
+        for main_order in res_orders:
             check_stop()
-            return_address_vo = sub_order.get("returnAddressVO", {})
-            expect_state_text = return_address_vo.get("expectStateText", "unKnown")
-            if expect_state_text == "请退款":
-                log_print(f"    [*] 订单 {tid} 状态为 {expect_state_text}，跳过")
+
+            if str(tid) != str(main_order.get("id", 'unknown')):
                 continue
 
-        new_info = parse_refund_address(refund_address, session)
-        log_print("    [*] 解析 refund_address:")
-        log_print(f"        姓名: {new_info['contactName']}")
-        log_print(f"        手机: {new_info['mobilePhone']}")
-        log_print(f"        省份: {new_info['provinceName']}")
-        log_print(f"        城市: {new_info['cityName']}")
-        log_print(f"        区县: {new_info['districtName']}")
-        log_print(f"        乡镇: {new_info['townName']}")
-        log_print(f"        divisionId: {new_info['divisionId']}")
-        log_print(f"        地址: {new_info['adr'][:60]}{'...' if len(new_info['adr']) > 60 else ''}")
+            sub_orders = main_order.get("subOrders", [])
+            for sub_order in sub_orders:
+                check_stop()
+                return_address_vo = sub_order.get("returnAddressVO", {})
+                expect_state_text = return_address_vo.get("expectStateText", "unKnown")
+                if expect_state_text == "请退款":
+                    log_print(f"    [*] 订单 {tid} 状态为 {expect_state_text}，跳过")
+                    continue
 
-        csrf = get_csrf_token(session)
-        if not csrf:
-            log_print("    [!] 无法从 Cookie 获取 XSRF-TOKEN，请重新抓取Cookie！")
-            fail_count += 1
-            append_order_record(FAIL_FILE, tid)
-            continue
+            new_info = parse_refund_address(refund_address, session)
+            log_print("    [*] 解析 refund_address:")
+            log_print(f"        姓名: {new_info['contactName']}")
+            log_print(f"        手机: {new_info['mobilePhone']}")
+            log_print(f"        省份: {new_info['provinceName']}")
+            log_print(f"        城市: {new_info['cityName']}")
+            log_print(f"        区县: {new_info['districtName']}")
+            log_print(f"        乡镇: {new_info['townName']}")
+            log_print(f"        divisionId: {new_info['divisionId']}")
+            log_print(f"        地址: {new_info['adr'][:60]}{'...' if len(new_info['adr']) > 60 else ''}")
 
-        safe_sleep(0.5)
-        check_stop()
-
-        log_print("    [*] 获取地址列表...")
-        addresses = get_address_list(session)
-        if not addresses:
-            log_print("    [!] 获取地址列表失败，跳过")
-            fail_count += 1
-            append_order_record(FAIL_FILE, tid)
-            continue
-        if len(addresses) < 3:
-            log_print("    [!] 地址总数不足3条，无法修改第3个地址，跳过")
-            fail_count += 1
-            append_order_record(FAIL_FILE, tid)
-            continue
-
-        target_addr = addresses[2]
-        run_ok = update_address(session, target_addr, new_info, csrf)
-        if not run_ok:
-            log_print(f"    [!] ❌ 订单 {tid} 地址更新失败")
-            fail_count += 1
-            append_order_record(FAIL_FILE, tid)
-            continue
-
-        new_address_id = target_addr.get("contactId", "")
-        for sub_order in sub_orders:
-            check_stop()
-            return_address_vo = sub_order.get("returnAddressVO", {})
-            return_address_content_vo = return_address_vo.get("returnAddressContentVO", {})
-            old_address_id = return_address_content_vo.get("addressId", "")
-
-            data_content = {
-                "orderId": tid,
-                "operation": "update",
-                "source": "qn",
-                "params": json.dumps({
-                    "orderId": tid,
-                    "newAddressId": new_address_id,
-                    "oldAddressId": old_address_id,
-                }, ensure_ascii=False),
-            }
-            log_print(f"修改订单地址请求体：{data_content}")
-
-            run_ok = update_order_address(
-                session,
-                cookie_jar,
-                json.dumps(data_content, ensure_ascii=False),
-            )
-            if run_ok:
-                log_print(f"    [+] ✅ 订单 {tid} 操作成功")
-                success_count += 1
-                append_order_record(SUCCESS_FILE, tid)
-            else:
-                log_print(f"    [!] ❌ 订单 {tid} 操作失败")
+            csrf = get_csrf_token(session)
+            if not csrf:
+                log_print("    [!] 无法从 Cookie 获取 XSRF-TOKEN，请重新抓取Cookie！")
                 fail_count += 1
                 append_order_record(FAIL_FILE, tid)
-            safe_sleep(0.8)
+                continue
+
+            safe_sleep(0.5)
+            check_stop()
+
+            log_print("    [*] 获取地址列表...")
+            addresses = get_address_list(session)
+            if not addresses:
+                log_print("    [!] 获取地址列表失败，跳过")
+                fail_count += 1
+                append_order_record(FAIL_FILE, tid)
+                continue
+            if len(addresses) < 3:
+                log_print("    [!] 地址总数不足3条，无法修改第3个地址，跳过")
+                fail_count += 1
+                append_order_record(FAIL_FILE, tid)
+                continue
+
+            target_addr = addresses[2]
+            run_ok = update_address(session, target_addr, new_info, csrf)
+            if not run_ok:
+                log_print(f"    [!] ❌ 订单 {tid} 地址更新失败")
+                fail_count += 1
+                append_order_record(FAIL_FILE, tid)
+                continue
+
+            new_address_id = target_addr.get("contactId", "")
+            for sub_order in sub_orders:
+                check_stop()
+                return_address_vo = sub_order.get("returnAddressVO", {})
+                return_address_content_vo = return_address_vo.get("returnAddressContentVO", {})
+                old_address_id = return_address_content_vo.get("addressId", "")
+
+                data_content = {
+                    "orderId": tid,
+                    "operation": "update",
+                    "source": "qn",
+                    "params": json.dumps({
+                        "orderId": tid,
+                        "newAddressId": new_address_id,
+                        "oldAddressId": old_address_id,
+                    }, ensure_ascii=False),
+                }
+                log_print(f"修改订单地址请求体：{data_content}")
+
+                run_ok = update_order_address(
+                    session,
+                    cookie_jar,
+                    json.dumps(data_content, ensure_ascii=False),
+                )
+                if run_ok:
+                    log_print(f"    [+] ✅ 订单 {tid} 操作成功")
+                    success_count += 1
+                    append_order_record(SUCCESS_FILE, tid)
+                else:
+                    log_print(f"    [!] ❌ 订单 {tid} 操作失败")
+                    fail_count += 1
+                    append_order_record(FAIL_FILE, tid)
+                safe_sleep(0.8)
 
     log_print(f"\n{'=' * 70}")
     log_print(
         f"[✓] 处理完成: 总计 {total} | "
-        f"成功 {success_count} | 跳过 {skip_count} | 失败 {fail_count}"
+        f"成功 {success_count} | 失败 {fail_count}"
     )
     log_print(f"{'=' * 70}")
 
