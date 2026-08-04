@@ -369,7 +369,7 @@ def is_port_open(port: int) -> bool:
         s.settimeout(1)
         return s.connect_ex(("127.0.0.1", port)) == 0
 
-
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 def find_chrome_executable():
     if sys.platform == "darwin":
         candidates = [
@@ -377,10 +377,11 @@ def find_chrome_executable():
             "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
         ]
     elif sys.platform == "win32":
+        local_chrome = os.path.join(BASE_DIR, "chrome", "chrome.exe")
         candidates = [
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-            os.path.abspath(r".\chrome\chrome.exe"),
+            local_chrome,
         ]
     else:
         candidates = [
