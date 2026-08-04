@@ -130,6 +130,7 @@ def safe_sleep(seconds: float):
     """可被立即中断的 sleep；任务停止时抛出 TaskStoppedException"""
     if _task_stop_event.wait(timeout=seconds):
         raise TaskStoppedException()
+    time.sleep(1)
 
 
 # ==================== 【修复】线程安全日志队列 代替直接print操作控件 ====================
@@ -804,8 +805,10 @@ def update_order_address(session, cookie_jar, data_content):
 
     try:
         result = resp.json()
-        if result.get("success") is True or result.get("isOk") is True:
-            return True
+        ret = result.get("ret", [])
+        for row in ret:
+            if row == 'SUCCESS::调用成功':
+                return True
         return False
     except Exception:
         return resp.status_code == 200
