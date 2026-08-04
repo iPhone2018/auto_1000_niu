@@ -531,7 +531,7 @@ def parse_refund_address(addr_str: str, session: requests.Session) -> dict:
     return {
         "contactName": resp_data.get("name", ""),
         "mobilePhone": resp_data.get("mobilePhone", ""),
-        "adr": resp_data.get("detailAddress", ""),
+        "adr": resp_data.get("province", "")+resp_data.get("city", "")+resp_data.get("county", "")+resp_data.get("town", "")+resp_data.get("detailAddress", ""),
         "provinceName": resp_data.get("province", ""),
         "cityName": resp_data.get("city", ""),
         "districtName": resp_data.get("county", ""),
@@ -734,7 +734,7 @@ def update_address(
 
     try:
         resp = session.post(url, data=data, headers=headers, timeout=30)
-        safe_sleep(0.5)
+        safe_sleep(1)
         check_stop()
     except Exception as e:
         log_print(f"    [!] 更新地址请求异常: {e}")
@@ -1180,7 +1180,7 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("订单地址自动修改工具")
-        self.root.geometry("950x750")
+        self.root.geometry("950x780")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         input_frame = ttk.Frame(root, padding=10)
@@ -1206,20 +1206,35 @@ class App:
         self.qn_pass.grid(row=1, column=3, padx=5)
         self.qn_pass.insert(0, "qqq123123")
 
-        ttk.Label(input_frame, text="执行间隔(分钟):").grid(row=2, column=0, sticky=tk.W, pady=3)
+        ttk.Label(input_frame, text="开始日期(YYYY‑MM‑DD):").grid(row=2, column=0, sticky=tk.W, pady=3)
+        self.start_date_entry = ttk.Entry(input_frame, width=15)
+        self.start_date_entry.grid(row=2, column=1, padx=5, sticky=tk.W)
+
+        ttk.Label(input_frame, text="结束日期(YYYY‑MM‑DD):").grid(row=2, column=2, sticky=tk.W, pady=3)
+        self.end_date_entry = ttk.Entry(input_frame, width=15)
+        self.end_date_entry.grid(row=2, column=3, padx=5, sticky=tk.W)
+
+        ttk.Label(input_frame, text="执行间隔(分钟):").grid(row=3, column=0, sticky=tk.W, pady=3)
         self.interval = ttk.Entry(input_frame, width=10)
-        self.interval.grid(row=2, column=1, sticky=tk.W, padx=5)
+        self.interval.grid(row=3, column=1, sticky=tk.W, padx=5)
         self.interval.insert(0, "60")
 
         btn_frame = ttk.Frame(input_frame)
-        btn_frame.grid(row=2, column=2, columnspan=2, pady=8)
+        btn_frame.grid(row=3, column=2, columnspan=2, pady=8)
         self.start_btn = ttk.Button(btn_frame, text="开始执行", command=self.start_task)
         self.start_btn.pack(side=tk.LEFT, padx=5)
         self.stop_btn = ttk.Button(btn_frame, text="停止执行", command=self.stop_task, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
 
+        # 设置默认日期：往前15天、今天
+        now = datetime.now()
+        default_start = (now - timedelta(days=15)).strftime("%Y-%m-%d")
+        default_end = now.strftime("%Y-%m-%d")
+        self.start_date_entry.insert(0, default_start)
+        self.end_date_entry.insert(0, default_end)
+
         ttk.Label(root, text="运行日志:", font=("Arial", 10, "bold")).pack(anchor=tk.W, padx=10, pady=(10, 0))
-        self.log_text = scrolledtext.ScrolledText(root, height=35, state=tk.NORMAL, wrap=tk.WORD)
+        self.log_text = scrolledtext.ScrolledText(root, height=36, state=tk.NORMAL, wrap=tk.WORD)
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
         self.running = False
@@ -1313,16 +1328,19 @@ class App:
         qn_username = self.qn_user.get().strip()
         qn_password = self.qn_pass.get().strip()
 
-        if not all([qz_username, qz_password, qn_username, qn_password]):
-            log_print("[!] 错误：请填写所有账号和密码")
+        ui_start_date = self.start_date_entry.get().strip()
+        ui_end_date = self.end_date_entry.get().strip()
+
+        if not all([qz_username, qz_password, qn_username, qn_password, ui_start_date, ui_end_date]):
+            log_print("[!] 错误：请填写账号密码以及开始、结束日期（格式 YYYY‑MM‑DD）")
             return
+
+        # 拼接时分秒：开始=00:00，结束=23:59
+        start_date = f"{ui_start_date} 00:00"
+        end_date = f"{ui_end_date} 23:59"
 
         filtered_tids = get_filtered_tids()
         log_print(f"\n[*] 当前已处理订单过滤数: {len(filtered_tids)}")
-
-        now = datetime.now()
-        end_date = now.strftime("%Y-%m-%d") + " 23:59"
-        start_date = (now - timedelta(days=15)).strftime("%Y-%m-%d") + " 00:00"
         log_print(f"[*] 本次查询日期范围: {start_date} ~ {end_date}")
 
         run_main_process(qz_username, qz_password, qn_username, qn_password,
