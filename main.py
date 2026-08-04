@@ -11,7 +11,7 @@ import requests
 import threading
 import tkinter as tk
 import shutil
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, filedialog
 from datetime import datetime, timedelta
 from queue import Queue, Empty
 
@@ -108,6 +108,8 @@ WL_HEADERS = {
 session = requests.Session()
 USERNAME = ""
 PASSWORD = ""
+# =========新增全局变量：用户手动选择Chrome路径=========
+g_user_chrome_path = ""
 
 # ==================== 全局停止控制 ====================
 _task_stop_event = threading.Event()
@@ -369,8 +371,17 @@ def is_port_open(port: int) -> bool:
         s.settimeout(1)
         return s.connect_ex(("127.0.0.1", port)) == 0
 
+
+# 获取脚本所在真实目录，解决工作目录错位
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 def find_chrome_executable():
+    # =========改动：优先使用UI手动选择的路径=========
+    global g_user_chrome_path
+    if g_user_chrome_path and os.path.isfile(g_user_chrome_path):
+        log_print(f"[*] 使用用户手动指定Chrome路径：{g_user_chrome_path}")
+        return g_user_chrome_path
+
     if sys.platform == "darwin":
         candidates = [
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -402,7 +413,7 @@ def ensure_chrome_debugging() -> bool:
 
     chrome_path = find_chrome_executable()
     if not chrome_path:
-        log_print("[!] 未找到 Chrome，请手动启动：")
+        log_print("[!] 未找到 Chrome，请在界面点击【选择】按钮指定chrome.exe，或手动启动：")
         if sys.platform == "darwin":
             log_print(r'    /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222')
         elif sys.platform == "win32":
@@ -1181,7 +1192,7 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("订单地址自动修改工具")
-        self.root.geometry("950x780")
+        self.root.geometry("950x820")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         input_frame = ttk.Frame(root, padding=10)
@@ -1220,8 +1231,16 @@ class App:
         self.interval.grid(row=3, column=1, sticky=tk.W, padx=5)
         self.interval.insert(0, "60")
 
+        # ============新增Chrome路径选择行 row4============
+        ttk.Label(input_frame, text="Chrome程序路径:").grid(row=4, column=0, sticky=tk.W, pady=3)
+        self.chrome_path_var = tk.StringVar()
+        self.chrome_entry = ttk.Entry(input_frame, textvariable=self.chrome_path_var, width=45)
+        self.chrome_entry.grid(row=4, column=1, columnspan=2, padx=5, sticky=tk.W)
+        self.btn_select_chrome = ttk.Button(input_frame, text="选择", command=self.select_chrome_file)
+        self.btn_select_chrome.grid(row=4, column=3, padx=3, sticky=tk.W)
+
         btn_frame = ttk.Frame(input_frame)
-        btn_frame.grid(row=3, column=2, columnspan=2, pady=8)
+        btn_frame.grid(row=5, column=0, columnspan=4, pady=8)
         self.start_btn = ttk.Button(btn_frame, text="开始执行", command=self.start_task)
         self.start_btn.pack(side=tk.LEFT, padx=5)
         self.stop_btn = ttk.Button(btn_frame, text="停止执行", command=self.stop_task, state=tk.DISABLED)
@@ -1235,7 +1254,7 @@ class App:
         self.end_date_entry.insert(0, default_end)
 
         ttk.Label(root, text="运行日志:", font=("Arial", 10, "bold")).pack(anchor=tk.W, padx=10, pady=(10, 0))
-        self.log_text = scrolledtext.ScrolledText(root, height=36, state=tk.NORMAL, wrap=tk.WORD)
+        self.log_text = scrolledtext.ScrolledText(root, height=34, state=tk.NORMAL, wrap=tk.WORD)
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
         self.running = False
@@ -1243,6 +1262,18 @@ class App:
         self.worker_thread = None
         # 启动日志消费循环
         self.consume_log_queue()
+
+    # =========新增回调函数：弹出文件选择框选chrome.exe=========
+    def select_chrome_file(self):
+        global g_user_chrome_path
+        file_path = filedialog.askopenfilename(
+            title="请选择 chrome.exe",
+            filetypes=[("Chrome可执行文件", "chrome.exe"), ("可执行程序", "*.exe"), ("全部文件", "*.*")]
+        )
+        if file_path:
+            g_user_chrome_path = file_path
+            self.chrome_path_var.set(file_path)
+            log_print(f"[*] 用户已设置Chrome路径：{file_path}")
 
     def consume_log_queue(self):
         """主线程定时读取日志队列，写入文本框【唯一线程安全方式】"""
@@ -1262,6 +1293,9 @@ class App:
         self.root.destroy()
 
     def start_task(self):
+        global g_user_chrome_path
+        # 如果输入框被手动修改，同步更新全局变量
+        g_user_chrome_path = self.chrome_path_var.get().strip()
         if self.running:
             return
         self.running = True
