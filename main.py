@@ -203,7 +203,7 @@ def read_order_records(filepath: str):
                 records[tid] = (ts, qn_username, '')
             else:
                 tid, ts, qn_username, reason = parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
-                records[tid] = (ts, '', reason)
+                records[tid] = (ts, qn_username, reason)
     return records
 
 
@@ -497,6 +497,7 @@ def cleanup_instance(instance_config: dict, kill_browser: bool = True):
         except Exception as e:
             log_print(f"[!] CDP 关闭 Chrome 失败，尝试强制结束: {e}")
             _kill_chrome_by_port(port)
+            safe_sleep(1.2) # 新增：kill进程后等待释放文件句柄，Windows必要
 
     # 3. 删除 Cookie 文件
     if cookie_file and os.path.exists(cookie_file):
@@ -511,6 +512,9 @@ def cleanup_instance(instance_config: dict, kill_browser: bool = True):
         try:
             shutil.rmtree(profile_dir)
             log_print(f"[*] 已清理 Profile 目录: {profile_dir}")
+        except PermissionError as e:
+            # Windows：进程残留持有BrowserMetrics‑xxx.pma句柄，捕获WinError5拒绝访问，不阻断程序
+            log_print(f"[!] Profile目录被进程占用，跳过本次删除(WinError5): {e}")
         except Exception as e:
             log_print(f"[!] 清理 Profile 目录失败: {e}")
 
@@ -586,6 +590,9 @@ def ensure_chrome_debugging(port: int, profile_dir: str) -> bool:
         f"--user-data-dir={profile_dir}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--disable-metrics",          # 新增：关闭BrowserMetrics *.pma文件生成
+        "--disable-metrics-reporting", # 新增
+        "--disable-logging"            # 新增：减少profile内生成日志文件
     ]
     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -686,6 +693,7 @@ def parse_refund_address(addr_str: str, session: requests.Session) -> dict:
     }
 
     try:
+        addr_str = addr_str.replace("pdd", "").replace("拼多", "").replace("拼多多", "")
         full_url = f"{url}?fullAddress={urllib.parse.quote(addr_str)}"
         resp = session.get(full_url, headers=headers, timeout=15)
         log_print(f"        ✅ 地址识别接口调用成功: {resp.text}")
