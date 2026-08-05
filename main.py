@@ -155,10 +155,16 @@ def read_order_records(filepath: str):
             line = line.strip()
             if not line:
                 continue
-            parts = line.split(",", 1)
+            parts = line.split(",")
             if len(parts) == 2:
                 tid, ts = parts[0].strip(), parts[1].strip()
-                records[tid] = ts
+                records[tid] = (ts, '', '')
+            elif len(parts) == 3:
+                tid, ts, qn_username = parts[0].strip(), parts[1].strip(), parts[2].strip()
+                records[tid] = (ts, qn_username, '')
+            else:
+                tid, ts, qn_username, reason = parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
+                records[tid] = (ts, '', reason)
     return records
 
 
@@ -169,23 +175,28 @@ def cleanup_old_records(filepath: str):
     records = read_order_records(filepath)
     cutoff = datetime.now() - timedelta(days=CLEANUP_DAYS)
     new_lines = []
-    for tid, ts in records.items():
+    for tid, ts_all in records.items():
+        ts, qn_username, reason = ts_all
         try:
             dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
             if dt >= cutoff:
-                new_lines.append(f"{tid},{ts}\n")
+                new_lines.append(f"{tid},{ts},{qn_username},{reason}\n")
         except Exception:
             # 时间格式异常则保留，避免误删
-            new_lines.append(f"{tid},{ts}\n")
+            new_lines.append(f"{tid},{ts},{qn_username},{reason}\n")
     with open(filepath, "w", encoding="utf-8") as f:
         f.writelines(new_lines)
 
 
-def append_order_record(filepath: str, tid):
+def append_order_record(filepath, tid, qn_username, reason=""):
     """追加订单记录，时间精确到秒"""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if reason:
+        line = f"{tid},{ts},{qn_username},{reason}\n"
+    else:
+        line = f"{tid},{ts},{qn_username},\n"
     with open(filepath, "a", encoding="utf-8") as f:
-        f.write(f"{tid},{ts}\n")
+        f.write(line)
 
 
 def get_filtered_tids() -> set:
@@ -534,7 +545,8 @@ def parse_refund_address(addr_str: str, session: requests.Session) -> dict:
     try:
         full_url = f"{url}?fullAddress={urllib.parse.quote(addr_str)}"
         resp = session.get(full_url, headers=headers, timeout=15)
-        resp_data = resp.json().get("data", "")
+        log_print(f"        ✅ 地址识别接口调用成功: {resp.text}")
+        resp_data = resp.json().get("data", {})
         safe_sleep(0.5)
         check_stop()
     except Exception as e:
@@ -1098,6 +1110,7 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
         wait_orders = []
         if order_info:
             res_orders.extend(order_info.get("mainOrders", []))
+
     for idx, order in enumerate(ORDERS):
         check_stop()
         tid = order["tid"]
@@ -1109,15 +1122,44 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
                 continue
 
             sub_orders = main_order.get("subOrders", [])
-            for sub_order in sub_orders:
-                check_stop()
-                return_address_vo = sub_order.get("returnAddressVO", {})
-                expect_state_text = return_address_vo.get("expectStateText", "unKnown")
-                if expect_state_text == "请退款":
-                    log_print(f"    [*] 订单 {tid} 状态为 {expect_state_text}，跳过")
-                    continue
+            if len(sub_orders) > 1:
+                fail_count += 1
+                append_order_record(FAIL_FILE, tid, qn_username, reason='订单有多个子订单')
+                log_print(f"    [*] 订单 {tid} 有 {len(sub_orders)} 个子订单，跳过")
+                continue
+
+            sub_order = sub_orders[0]
+
+            return_address_vo = sub_order.get("returnAddressVO", {})
+
+            place_holder_info = return_address_vo.get("placeHolderInfo", "unknown")
+            if place_holder_info == '订单不支持':
+                fail_count += 1
+                append_order_record(FAIL_FILE, tid, qn_username, reason='订单不支持')
+                log_print(f"    [*] 订单 {tid} 不支持，跳过")
+                continue
+
+            expect_state_text = return_address_vo.get("expectStateText", "unknown")
+            if expect_state_text == '已指定':
+                fail_count += 1
+                append_order_record(FAIL_FILE, tid, qn_username, reason='订单已指定')
+                log_print(f"    [*] 订单 {tid} 已指定，跳过")
+                continue
+
+            expect_color = return_address_vo.get("expectColor", "")
+            if expect_color != '#FF0000':
+                fail_count += 1
+                append_order_record(FAIL_FILE, tid, qn_username, reason='订单指定地址熄灭不支持修改')
+                log_print(f"    [*] 订单 {tid} 状态颜色为 {expect_color}，跳过")
+                continue
 
             new_info = parse_refund_address(refund_address, session)
+            if not new_info:
+                log_print("    [*] 订单 {tid} 识别地址失败，跳过")
+                fail_count += 1
+                append_order_record(FAIL_FILE, tid, qn_username, reason='识别地址失败')
+                continue
+
             log_print("    [*] 解析 refund_address:")
             log_print(f"        姓名: {new_info['contactName']}")
             log_print(f"        手机: {new_info['mobilePhone']}")
@@ -1132,7 +1174,7 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
             if not csrf:
                 log_print("    [!] 无法从 Cookie 获取 XSRF-TOKEN，请重新抓取Cookie！")
                 fail_count += 1
-                append_order_record(FAIL_FILE, tid)
+                append_order_record(FAIL_FILE, tid, qn_username, reason='csrf_token获取失败')
                 continue
 
             safe_sleep(0.5)
@@ -1143,12 +1185,12 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
             if not addresses:
                 log_print("    [!] 获取地址列表失败，跳过")
                 fail_count += 1
-                append_order_record(FAIL_FILE, tid)
+                append_order_record(FAIL_FILE, tid, qn_username, reason='获取地址列表失败')
                 continue
             if len(addresses) < 3:
                 log_print("    [!] 地址总数不足3条，无法修改第3个地址，跳过")
                 fail_count += 1
-                append_order_record(FAIL_FILE, tid)
+                append_order_record(FAIL_FILE, tid, qn_username, reason='地址列表不足3条')
                 continue
 
             target_addr = addresses[2]
@@ -1156,42 +1198,40 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
             if not run_ok:
                 log_print(f"    [!] ❌ 订单 {tid} 地址更新失败")
                 fail_count += 1
-                append_order_record(FAIL_FILE, tid)
+                append_order_record(FAIL_FILE, tid, qn_username, reason='地址更新失败')
                 continue
 
             new_address_id = target_addr.get("contactId", "")
-            for sub_order in sub_orders:
-                check_stop()
-                return_address_vo = sub_order.get("returnAddressVO", {})
-                return_address_content_vo = return_address_vo.get("returnAddressContentVO", {})
-                old_address_id = return_address_content_vo.get("addressId", "")
+            return_address_vo = sub_order.get("returnAddressVO", {})
+            return_address_content_vo = return_address_vo.get("returnAddressContentVO", {})
+            old_address_id = return_address_content_vo.get("addressId", "")
 
-                data_content = {
+            data_content = {
+                "orderId": tid,
+                "operation": "update",
+                "source": "qn",
+                "params": json.dumps({
                     "orderId": tid,
-                    "operation": "update",
-                    "source": "qn",
-                    "params": json.dumps({
-                        "orderId": tid,
-                        "newAddressId": new_address_id,
-                        "oldAddressId": old_address_id,
-                    }, ensure_ascii=False),
-                }
-                log_print(f"修改订单地址请求体：{data_content}")
+                    "newAddressId": new_address_id,
+                    "oldAddressId": old_address_id,
+                }, ensure_ascii=False),
+            }
+            log_print(f"修改订单地址请求体：{data_content}")
 
-                run_ok = update_order_address(
-                    session,
-                    cookie_jar,
-                    json.dumps(data_content, ensure_ascii=False),
-                )
-                if run_ok:
-                    log_print(f"    [+] ✅ 订单 {tid} 操作成功")
-                    success_count += 1
-                    append_order_record(SUCCESS_FILE, tid)
-                else:
-                    log_print(f"    [!] ❌ 订单 {tid} 操作失败")
-                    fail_count += 1
-                    append_order_record(FAIL_FILE, tid)
-                safe_sleep(0.8)
+            run_ok = update_order_address(
+                session,
+                cookie_jar,
+                json.dumps(data_content, ensure_ascii=False),
+            )
+            if run_ok:
+                log_print(f"    [+] ✅ 订单 {tid} 操作成功")
+                success_count += 1
+                append_order_record(SUCCESS_FILE, tid, qn_username, reason='修改成功')
+            else:
+                log_print(f"    [!] ❌ 订单 {tid} 操作失败")
+                fail_count += 1
+                append_order_record(FAIL_FILE, tid, qn_username, reason='订单地址修改失败')
+            safe_sleep(0.8)
 
     log_print(f"\n{'=' * 70}")
     log_print(
