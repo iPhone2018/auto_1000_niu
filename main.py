@@ -11,6 +11,7 @@ import requests
 import threading
 import tkinter as tk
 import shutil
+import contextlib
 from tkinter import ttk, scrolledtext, messagebox, filedialog
 from datetime import datetime, timedelta
 from queue import Queue, Empty
@@ -25,8 +26,8 @@ TARGET_URL = (
     "?spm=a21bo.jianhua/a.1997525073.1.5af92a892zcUYK"
 )
 
-COOKIE_FILE = "taobao_cookies.json"
-DEBUG_PORT = 9222
+ACCOUNT_STORE_FILE = "account_store.json"
+DEBUG_PORT_RANGE = (9222, 9322)
 MAX_WAIT = 300
 RUN_MODE = 0
 
@@ -108,37 +109,75 @@ WL_HEADERS = {
 session = requests.Session()
 USERNAME = ""
 PASSWORD = ""
-# =========新增全局变量：用户手动选择Chrome路径=========
 g_user_chrome_path = ""
+INSTANCE_NAME = ""
 
 # ==================== 全局停止控制 ====================
 _task_stop_event = threading.Event()
 
 
 class TaskStoppedException(Exception):
-    """用于快速跳出多层循环的任务停止异常"""
     pass
 
 
 def check_stop():
-    """检查是否已收到停止信号，是则抛出 TaskStoppedException 立即中断"""
     if _task_stop_event.is_set():
         raise TaskStoppedException()
 
 
 def safe_sleep(seconds: float):
-    """可被立即中断的 sleep；任务停止时抛出 TaskStoppedException"""
     if _task_stop_event.wait(timeout=seconds):
         raise TaskStoppedException()
     time.sleep(1)
 
 
-# ==================== 【修复】线程安全日志队列 代替直接print操作控件 ====================
+# ==================== 线程安全日志队列 ====================
 LOG_QUEUE = Queue(maxsize=2000)
 
+
 def log_print(text):
-    """线程安全打印，投递到队列，禁止直接print写入UI"""
-    LOG_QUEUE.put(text)
+    prefix = f"[{INSTANCE_NAME}] " if INSTANCE_NAME else ""
+    LOG_QUEUE.put(prefix + text)
+
+
+# ==================== 账号存储工具函数（新增并发保护）====================
+
+try:
+    from filelock import FileLock
+    _ACCOUNT_LOCK = FileLock(ACCOUNT_STORE_FILE + ".lock", timeout=5)
+except Exception:
+    _ACCOUNT_LOCK = contextlib.nullcontext()
+
+
+def load_account_store():
+    with _ACCOUNT_LOCK:
+        if not os.path.exists(ACCOUNT_STORE_FILE):
+            return {"qz": {}, "qn": {}}
+        try:
+            with open(ACCOUNT_STORE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {"qz": {}, "qn": {}}
+
+
+def save_account_store(store_data):
+    with _ACCOUNT_LOCK:
+        tmp_file = ACCOUNT_STORE_FILE + ".tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(store_data, f, ensure_ascii=False, indent=2)
+        if os.path.exists(ACCOUNT_STORE_FILE):
+            os.replace(tmp_file, ACCOUNT_STORE_FILE)
+        else:
+            os.rename(tmp_file, ACCOUNT_STORE_FILE)
+
+
+def save_one_account(acc_type: str, username: str, password: str):
+    if not username.strip():
+        return
+    store = load_account_store()
+    store[acc_type][username.strip()] = password
+    save_account_store(store)
+
 
 # ==================== 执行记录文件管理 ====================
 SUCCESS_FILE = "success.txt"
@@ -169,7 +208,6 @@ def read_order_records(filepath: str):
 
 
 def cleanup_old_records(filepath: str):
-    """清理超过30天的记录，保留30天内的"""
     if not os.path.exists(filepath):
         return
     records = read_order_records(filepath)
@@ -182,14 +220,12 @@ def cleanup_old_records(filepath: str):
             if dt >= cutoff:
                 new_lines.append(f"{tid},{ts},{qn_username},{reason}\n")
         except Exception:
-            # 时间格式异常则保留，避免误删
             new_lines.append(f"{tid},{ts},{qn_username},{reason}\n")
     with open(filepath, "w", encoding="utf-8") as f:
         f.writelines(new_lines)
 
 
 def append_order_record(filepath, tid, qn_username, reason=""):
-    """追加订单记录，时间精确到秒"""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if reason:
         line = f"{tid},{ts},{qn_username},{reason}\n"
@@ -384,11 +420,32 @@ def is_port_open(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-# 获取脚本所在真实目录，解决工作目录错位
+def find_free_port(start_port: int = 9222, end_port: int = 9322) -> int:
+    for port in range(start_port, end_port + 1):
+        if not is_port_open(port):
+            log_print(f"[*] 分配调试端口: {port}")
+            return port
+    raise RuntimeError(f"在 {start_port}-{end_port} 范围内未找到可用端口")
+
+
+def get_instance_config(qn_username: str) -> dict:
+    safe_name = re.sub(r'[^\w\u4e00-\u9fff]', '_', qn_username)[:30]
+    port = find_free_port(DEBUG_PORT_RANGE[0], DEBUG_PORT_RANGE[1])
+    profile_dir = os.path.expanduser(f"~/playwright_chrome_profile_{safe_name}_{port}")
+    cookie_file = f"taobao_cookies_{safe_name}_{port}.json"
+    os.makedirs(profile_dir, exist_ok=True)
+    return {
+        "port": port,
+        "profile_dir": profile_dir,
+        "cookie_file": cookie_file,
+        "safe_name": safe_name,
+    }
+
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+
 def find_chrome_executable():
-    # =========改动：优先使用UI手动选择的路径=========
     global g_user_chrome_path
     if g_user_chrome_path and os.path.isfile(g_user_chrome_path):
         log_print(f"[*] 使用用户手动指定Chrome路径：{g_user_chrome_path}")
@@ -418,9 +475,9 @@ def find_chrome_executable():
     return None
 
 
-def ensure_chrome_debugging() -> bool:
-    if is_port_open(DEBUG_PORT):
-        log_print(f"[*] 检测到 Chrome 调试端口 {DEBUG_PORT} 已开启")
+def ensure_chrome_debugging(port: int, profile_dir: str) -> bool:
+    if is_port_open(port):
+        log_print(f"[*] 检测到 Chrome 调试端口 {port} 已开启")
         return True
 
     chrome_path = find_chrome_executable()
@@ -433,14 +490,13 @@ def ensure_chrome_debugging() -> bool:
             log_print(r'    .\chrome\chrome.exe --remote-debugging-port=9222')
         return False
 
-    log_print(f"[*] 尝试启动 Chrome（调试端口 {DEBUG_PORT}）...")
-    user_data_dir = os.path.expanduser("~/playwright_chrome_profile")
-    os.makedirs(user_data_dir, exist_ok=True)
+    log_print(f"[*] 尝试启动 Chrome（调试端口 {port}）...")
+    os.makedirs(profile_dir, exist_ok=True)
 
     cmd = [
         chrome_path,
-        f"--remote-debugging-port={DEBUG_PORT}",
-        f"--user-data-dir={user_data_dir}",
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile_dir}",
         "--no-first-run",
         "--no-default-browser-check",
     ]
@@ -448,7 +504,7 @@ def ensure_chrome_debugging() -> bool:
 
     for i in range(10):
         safe_sleep(1)
-        if is_port_open(DEBUG_PORT):
+        if is_port_open(port):
             log_print("[+] Chrome 启动成功")
             return True
         log_print(f"    等待 Chrome 就绪... ({i + 1}/10)")
@@ -764,11 +820,49 @@ def update_address(
     try:
         result = resp.json()
         log_print(f"    [*] 响应: {json.dumps(result, ensure_ascii=False)}")
-        return result.get("success", False) is True
     except Exception as e:
         log_print(f"    [!] 解析响应失败: {e}")
         log_print(f"        响应文本: {resp.text[:500]}")
         return False
+
+    if result.get("success", False):
+        return True
+    else:
+        if '是否仍要提交' not in result.get('message', 'unknown'):
+            return False
+    log_print("    [!] 触发仍要提交接口调用")
+    force_data = data.copy()
+    force_data["ignoreCheck"] = "true"
+    try:
+        resp_force = session.post(
+            url,
+            data=force_data,
+            headers=headers,
+            timeout=30
+        )
+        safe_sleep(1)
+        check_stop()
+    except Exception as e:
+        log_print(f"    [!] 强制提交请求异常: {e}")
+        return False
+
+    log_print(f"    [*] 强制保存 saveSellerContact 状态码: {resp_force.status_code}")
+    try:
+        result_force = resp_force.json()
+        log_print(f"    [*] 强制提交响应: {json.dumps(result_force, ensure_ascii=False)}")
+    except Exception as e:
+        log_print(f"    [!] 强制提交解析响应失败: {e}")
+        log_print(f"        响应文本: {resp_force.text[:500]}")
+        return False
+
+    if result_force.get("success", False):
+        log_print("    [√] 地址强制更新成功")
+        return True
+    else:
+        log_print(f"    [!] 强制提交仍然失败，msg={result_force.get('message', '')}")
+        return False
+
+
 
 
 def update_order_address(session, cookie_jar, data_content):
@@ -835,12 +929,15 @@ def calc_mtop_sign(token: str, t_ms: str, appkey: str, data_raw: str) -> str:
 # ==================== 核心流程 ====================
 
 def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_password: str,
-                     filtered_tids: set, start_date: str, end_date: str):
+                     filtered_tids: set, start_date: str, end_date: str, instance_config: dict):
     global session, USERNAME, PASSWORD
     USERNAME = qn_username
     PASSWORD = qn_password
 
-    # ---- 雀手：登录并获取订单 ----
+    port = instance_config["port"]
+    profile_dir = instance_config["profile_dir"]
+    cookie_file = instance_config["cookie_file"]
+
     login_success = login(qz_username, qz_password)
     if not login_success:
         log_print("雀手登录失败！")
@@ -892,7 +989,6 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
         log_print("没有订单！")
         return
 
-    # ---- 提取需要查询地址的订单 ----
     new_orders = []
     targetShopIdList = []
     seen_shop_id = set()
@@ -930,7 +1026,6 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
         log_print("没有需要查询地址的供应商！")
         return
 
-    # ---- 批量查询供应商地址 ----
     BATCH_MAX = 20
     shop_address_map = {}
     for batch_start in range(0, len(targetShopIdList), BATCH_MAX):
@@ -954,13 +1049,12 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
         item["refund_address"] = addr
         final_result.append(item)
 
-    # ---- 千牛：浏览器登录并获取 Cookie ----
-    if not ensure_chrome_debugging():
+    if not ensure_chrome_debugging(port, profile_dir):
         return
 
     with sync_playwright() as p:
         log_print("[*] 正在通过 CDP 连接到 Chrome...")
-        browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{DEBUG_PORT}")
+        browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
 
         if len(browser.contexts) == 0:
             log_print("[!] 未找到浏览器上下文")
@@ -1023,19 +1117,16 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
             logged_in = False
             start_time = time.time()
             last_tip = ""
-            # 持续循环等待，支持多层验证码
             while time.time() - start_time < MAX_WAIT:
                 check_stop()
                 is_login_success, msg = is_logged_in(page)
                 if is_login_success:
                     log_print(f"\n[+] ✅ 全部验证完成，登录成功！({msg})")
                     logged_in = True
-                    # 登录成功额外等待页面完全加载，保证Cookie完整
                     log_print("[*] 等待工作台页面加载完成...")
                     safe_sleep(4)
                     break
 
-                # 提示信息变化才打印，减少刷屏
                 if msg != last_tip:
                     log_print(f"    [等待验证] {msg}")
                     last_tip = msg
@@ -1056,15 +1147,14 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
         unique_cookies = get_unique_cookies(cookies)
         log_print(f"\n[+] 原始 Cookie 数: {len(cookies)}, 去重后: {len(unique_cookies)}")
 
-        with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+        with open(cookie_file, "w", encoding="utf-8") as f:
             json.dump(unique_cookies, f, ensure_ascii=False, indent=2)
-        log_print(f"[+] 已保存: {COOKIE_FILE}")
+        log_print(f"[+] 已保存: {cookie_file}")
 
-    # ---- 加载 Cookie 并处理订单 ----
     try:
-        cookie_jar = load_cookies(COOKIE_FILE)
+        cookie_jar = load_cookies(cookie_file)
     except FileNotFoundError:
-        log_print(f"[!] 找不到 Cookie 文件: {COOKIE_FILE}")
+        log_print(f"[!] 找不到 Cookie 文件: {cookie_file}")
         return
     except Exception as e:
         log_print(f"[!] 加载 Cookie 失败: {e}")
@@ -1155,7 +1245,7 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
 
             new_info = parse_refund_address(refund_address, session)
             if not new_info:
-                log_print("    [*] 订单 {tid} 识别地址失败，跳过")
+                log_print(f"    [*] 订单 {tid} 识别地址失败，跳过")
                 fail_count += 1
                 append_order_record(FAIL_FILE, tid, qn_username, reason='识别地址失败')
                 continue
@@ -1252,10 +1342,16 @@ class App:
         input_frame = ttk.Frame(root, padding=10)
         input_frame.pack(fill=tk.X)
 
+        self.acc_store = load_account_store()
+
         ttk.Label(input_frame, text="雀手账号:").grid(row=0, column=0, sticky=tk.W, pady=3)
-        self.qz_user = ttk.Entry(input_frame, width=30)
+        self.qz_user_var = tk.StringVar()
+        self.qz_user = ttk.Combobox(input_frame, textvariable=self.qz_user_var, width=30)
+        qz_list = list(self.acc_store["qz"].keys())
+        self.qz_user['values'] = qz_list
         self.qz_user.grid(row=0, column=1, padx=5)
-        self.qz_user.insert(0, "17850939652")
+        self.qz_user.bind("<<ComboboxSelected>>", self.on_qz_account_select)
+        self.qz_user_var.set("17850939652")
 
         ttk.Label(input_frame, text="雀手密码:").grid(row=0, column=2, sticky=tk.W, pady=3)
         self.qz_pass = ttk.Entry(input_frame, width=30, show="*")
@@ -1263,9 +1359,13 @@ class App:
         self.qz_pass.insert(0, "qqq123123")
 
         ttk.Label(input_frame, text="千牛账号:").grid(row=1, column=0, sticky=tk.W, pady=3)
-        self.qn_user = ttk.Entry(input_frame, width=30)
+        self.qn_user_var = tk.StringVar()
+        self.qn_user = ttk.Combobox(input_frame, textvariable=self.qn_user_var, width=30)
+        qn_list = list(self.acc_store["qn"].keys())
+        self.qn_user['values'] = qn_list
         self.qn_user.grid(row=1, column=1, padx=5)
-        self.qn_user.insert(0, "smotouchmud旗舰店:测试")
+        self.qn_user.bind("<<ComboboxSelected>>", self.on_qn_account_select)
+        self.qn_user_var.set("smotouchmud旗舰店:测试")
 
         ttk.Label(input_frame, text="千牛密码:").grid(row=1, column=2, sticky=tk.W, pady=3)
         self.qn_pass = ttk.Entry(input_frame, width=30, show="*")
@@ -1285,7 +1385,6 @@ class App:
         self.interval.grid(row=3, column=1, sticky=tk.W, padx=5)
         self.interval.insert(0, "60")
 
-        # ============新增Chrome路径选择行 row4============
         ttk.Label(input_frame, text="Chrome程序路径:").grid(row=4, column=0, sticky=tk.W, pady=3)
         self.chrome_path_var = tk.StringVar()
         self.chrome_entry = ttk.Entry(input_frame, textvariable=self.chrome_path_var, width=45)
@@ -1300,7 +1399,6 @@ class App:
         self.stop_btn = ttk.Button(btn_frame, text="停止执行", command=self.stop_task, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
 
-        # 设置默认日期：往前15天、今天
         now = datetime.now()
         default_start = (now - timedelta(days=15)).strftime("%Y-%m-%d")
         default_end = now.strftime("%Y-%m-%d")
@@ -1314,10 +1412,21 @@ class App:
         self.running = False
         self.timer = None
         self.worker_thread = None
-        # 启动日志消费循环
+        self.instance_config = None
         self.consume_log_queue()
 
-    # =========新增回调函数：弹出文件选择框选chrome.exe=========
+    def on_qz_account_select(self, event):
+        acc = self.qz_user_var.get().strip()
+        pwd = self.acc_store["qz"].get(acc, "")
+        self.qz_pass.delete(0, tk.END)
+        self.qz_pass.insert(0, pwd)
+
+    def on_qn_account_select(self, event):
+        acc = self.qn_user_var.get().strip()
+        pwd = self.acc_store["qn"].get(acc, "")
+        self.qn_pass.delete(0, tk.END)
+        self.qn_pass.insert(0, pwd)
+
     def select_chrome_file(self):
         global g_user_chrome_path
         file_path = filedialog.askopenfilename(
@@ -1330,7 +1439,6 @@ class App:
             log_print(f"[*] 用户已设置Chrome路径：{file_path}")
 
     def consume_log_queue(self):
-        """主线程定时读取日志队列，写入文本框【唯一线程安全方式】"""
         try:
             while True:
                 msg = LOG_QUEUE.get_nowait()
@@ -1338,20 +1446,45 @@ class App:
                 self.log_text.see(tk.END)
         except Empty:
             pass
-        # 每隔50ms再次执行
         self.root.after(50, self.consume_log_queue)
 
     def on_close(self):
-        # 窗口关闭前停止任务
         self.stop_task()
         self.root.destroy()
 
+    def refresh_account_combobox(self):
+        self.acc_store = load_account_store()
+        self.qz_user['values'] = list(self.acc_store["qz"].keys())
+        self.qn_user['values'] = list(self.acc_store["qn"].keys())
+
     def start_task(self):
-        global g_user_chrome_path
-        # 如果输入框被手动修改，同步更新全局变量
+        global g_user_chrome_path, INSTANCE_NAME
         g_user_chrome_path = self.chrome_path_var.get().strip()
         if self.running:
             return
+
+        qz_acc = self.qz_user_var.get().strip()
+        qz_pwd = self.qz_pass.get().strip()
+        qn_acc = self.qn_user_var.get().strip()
+        qn_pwd = self.qn_pass.get().strip()
+        save_one_account("qz", qz_acc, qz_pwd)
+        save_one_account("qn", qn_acc, qn_pwd)
+        self.refresh_account_combobox()
+
+        # 【关键】设置实例标识，用于日志前缀和窗口标题
+        INSTANCE_NAME = qn_acc
+
+        # 【关键】为当前实例分配独立端口、Profile、Cookie文件
+        try:
+            self.instance_config = get_instance_config(qn_acc)
+        except RuntimeError as e:
+            log_print(f"[!] {e}")
+            return
+
+        self.root.title(
+            f"订单地址自动修改工具 - {qn_acc} (端口:{self.instance_config['port']})"
+        )
+
         self.running = True
         _task_stop_event.clear()
         self.start_btn.config(state=tk.DISABLED)
@@ -1412,9 +1545,9 @@ class App:
     def execute_once(self):
         if _task_stop_event.is_set():
             return
-        qz_username = self.qz_user.get().strip()
+        qz_username = self.qz_user_var.get().strip()
         qz_password = self.qz_pass.get().strip()
-        qn_username = self.qn_user.get().strip()
+        qn_username = self.qn_user_var.get().strip()
         qn_password = self.qn_pass.get().strip()
 
         ui_start_date = self.start_date_entry.get().strip()
@@ -1424,7 +1557,6 @@ class App:
             log_print("[!] 错误：请填写账号密码以及开始、结束日期（格式 YYYY‑MM‑DD）")
             return
 
-        # 拼接时分秒：开始=00:00，结束=23:59
         start_date = f"{ui_start_date} 00:00"
         end_date = f"{ui_end_date} 23:59"
 
@@ -1433,7 +1565,7 @@ class App:
         log_print(f"[*] 本次查询日期范围: {start_date} ~ {end_date}")
 
         run_main_process(qz_username, qz_password, qn_username, qn_password,
-                         filtered_tids, start_date, end_date)
+                         filtered_tids, start_date, end_date, self.instance_config)
 
         cleanup_old_records(SUCCESS_FILE)
         cleanup_old_records(FAIL_FILE)
