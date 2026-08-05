@@ -428,6 +428,93 @@ def find_free_port(start_port: int = 9222, end_port: int = 9322) -> int:
     raise RuntimeError(f"在 {start_port}-{end_port} 范围内未找到可用端口")
 
 
+def _kill_chrome_by_port(port: int):
+    """通过端口查找并强制结束对应的 Chrome 进程"""
+    if not is_port_open(port):
+        return
+    try:
+        if sys.platform == "win32":
+            result = subprocess.run(
+                f'netstat -ano | findstr :{port}',
+                shell=True, capture_output=True, text=True
+            )
+            for line in result.stdout.splitlines():
+                if f"127.0.0.1:{port}" in line or f"0.0.0.0:{port}" in line:
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        pid = parts[-1]
+                        subprocess.run(
+                            f'taskkill /F /PID {pid}',
+                            shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                        )
+                        log_print(f"[*] 已强制结束 Chrome 进程 PID:{pid} (端口 {port})")
+                        break
+        else:
+            result = subprocess.run(
+                f"lsof -ti tcp:{port}",
+                shell=True, capture_output=True, text=True
+            )
+            pid = result.stdout.strip()
+            if pid:
+                subprocess.run(
+                    f"kill -9 {pid}",
+                    shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                log_print(f"[*] 已强制结束 Chrome 进程 PID:{pid} (端口 {port})")
+    except Exception as e:
+        log_print(f"[!] 强制结束 Chrome 进程失败: {e}")
+
+
+def cleanup_instance(instance_config: dict, kill_browser: bool = True):
+    """
+    清理实例资源：
+    - 重置雀手 requests.Session（清空 cookies）
+    - 关闭 Chrome 浏览器（CDP优雅关闭 → 强制kill降级）
+    - 删除独立 Cookie 文件
+    - 可选删除 Profile 目录（切换账号时彻底清理）
+    """
+    global session
+
+    # 1. 清理雀手 Session（全局 requests.Session）
+    if session:
+        session.cookies.clear()
+        log_print("[*] 已清空雀手 Session Cookies")
+
+    if not instance_config:
+        return
+
+    port = instance_config.get("port")
+    cookie_file = instance_config.get("cookie_file")
+    profile_dir = instance_config.get("profile_dir")
+
+    # 2. 关闭 Chrome（千牛）
+    if port and is_port_open(port):
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+                browser.close()
+                log_print(f"[*] 已通过 CDP 关闭 Chrome (端口 {port})")
+        except Exception as e:
+            log_print(f"[!] CDP 关闭 Chrome 失败，尝试强制结束: {e}")
+            _kill_chrome_by_port(port)
+
+    # 3. 删除 Cookie 文件
+    if cookie_file and os.path.exists(cookie_file):
+        try:
+            os.remove(cookie_file)
+            log_print(f"[*] 已删除 Cookie 文件: {cookie_file}")
+        except Exception as e:
+            log_print(f"[!] 删除 Cookie 文件失败: {e}")
+
+    # 4. 切换账号时彻底删除 Profile（避免缓存串号）
+    if kill_browser and profile_dir and os.path.exists(profile_dir):
+        try:
+            shutil.rmtree(profile_dir)
+            log_print(f"[*] 已清理 Profile 目录: {profile_dir}")
+        except Exception as e:
+            log_print(f"[!] 清理 Profile 目录失败: {e}")
+
+
 def get_instance_config(qn_username: str) -> dict:
     safe_name = re.sub(r'[^\w\u4e00-\u9fff]', '_', qn_username)[:30]
     port = find_free_port(DEBUG_PORT_RANGE[0], DEBUG_PORT_RANGE[1])
@@ -820,49 +907,11 @@ def update_address(
     try:
         result = resp.json()
         log_print(f"    [*] 响应: {json.dumps(result, ensure_ascii=False)}")
+        return result.get("success", False) is True
     except Exception as e:
         log_print(f"    [!] 解析响应失败: {e}")
         log_print(f"        响应文本: {resp.text[:500]}")
         return False
-
-    if result.get("success", False):
-        return True
-    else:
-        if '是否仍要提交' not in result.get('message', 'unknown'):
-            return False
-    log_print("    [!] 触发仍要提交接口调用")
-    force_data = data.copy()
-    force_data["ignoreCheck"] = "true"
-    try:
-        resp_force = session.post(
-            url,
-            data=force_data,
-            headers=headers,
-            timeout=30
-        )
-        safe_sleep(1)
-        check_stop()
-    except Exception as e:
-        log_print(f"    [!] 强制提交请求异常: {e}")
-        return False
-
-    log_print(f"    [*] 强制保存 saveSellerContact 状态码: {resp_force.status_code}")
-    try:
-        result_force = resp_force.json()
-        log_print(f"    [*] 强制提交响应: {json.dumps(result_force, ensure_ascii=False)}")
-    except Exception as e:
-        log_print(f"    [!] 强制提交解析响应失败: {e}")
-        log_print(f"        响应文本: {resp_force.text[:500]}")
-        return False
-
-    if result_force.get("success", False):
-        log_print("    [√] 地址强制更新成功")
-        return True
-    else:
-        log_print(f"    [!] 强制提交仍然失败，msg={result_force.get('message', '')}")
-        return False
-
-
 
 
 def update_order_address(session, cookie_jar, data_content):
@@ -1413,6 +1462,7 @@ class App:
         self.timer = None
         self.worker_thread = None
         self.instance_config = None
+        self.prev_instance_config = None  # 用于跟踪上一个实例，切换账号时清理
         self.consume_log_queue()
 
     def on_qz_account_select(self, event):
@@ -1450,6 +1500,9 @@ class App:
 
     def on_close(self):
         self.stop_task()
+        # 窗口关闭时彻底清理所有资源
+        cleanup_instance(self.instance_config, kill_browser=True)
+        self.instance_config = None
         self.root.destroy()
 
     def refresh_account_combobox(self):
@@ -1470,6 +1523,13 @@ class App:
         save_one_account("qz", qz_acc, qz_pwd)
         save_one_account("qn", qn_acc, qn_pwd)
         self.refresh_account_combobox()
+
+        # 【关键】如果已有旧实例（切换账号/重新执行），先彻底清理旧会话
+        if self.instance_config:
+            log_print("[*] 检测到已有实例，正在清理旧会话...")
+            cleanup_instance(self.instance_config, kill_browser=True)
+            self.prev_instance_config = self.instance_config
+            self.instance_config = None
 
         # 【关键】设置实例标识，用于日志前缀和窗口标题
         INSTANCE_NAME = qn_acc
@@ -1510,7 +1570,11 @@ class App:
             self.timer = None
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
-        log_print("\n[!] 已发送停止信号，正在中断当前操作...\n")
+        log_print("\n[!] 已发送停止信号，正在中断当前操作并清理会话...")
+        # 【关键】停止时彻底清理雀手+千牛会话
+        cleanup_instance(self.instance_config, kill_browser=True)
+        self.instance_config = None
+        log_print("[*] 会话清理完成\n")
 
     def run_loop(self):
         if _task_stop_event.is_set():
@@ -1540,7 +1604,10 @@ class App:
             self.running = False
             self.start_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
-            log_print("\n[*] 定时任务已完全停止\n")
+            # 【关键】单次执行完毕或停止后，清理会话避免Cookie残留
+            cleanup_instance(self.instance_config, kill_browser=True)
+            self.instance_config = None
+            log_print("\n[*] 定时任务已完全停止，会话已清理\n")
 
     def execute_once(self):
         if _task_stop_event.is_set():
@@ -1570,6 +1637,9 @@ class App:
         cleanup_old_records(SUCCESS_FILE)
         cleanup_old_records(FAIL_FILE)
         log_print("\n[*] 本次执行完毕，已清理超30天的历史记录")
+        # 【关键】单次执行完毕后清理会话，避免切换账号时Cookie串用
+        cleanup_instance(self.instance_config, kill_browser=True)
+        self.instance_config = None
 
 
 def main():
