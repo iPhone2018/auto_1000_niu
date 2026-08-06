@@ -683,6 +683,11 @@ def load_cookies(filepath: str) -> RequestsCookieJar:
 
 
 def parse_refund_address(addr_str: str, session: requests.Session) -> dict:
+    # 空文本或占位文本直接返回空 dict，避免无效数据覆盖地址簿
+    if not addr_str or not addr_str.strip() or addr_str.strip() == "暂无退货地址":
+        log_print(f"        ⚠️ 地址文本为空或占位文本，跳过解析")
+        return {}
+
     url = "https://wuliu2.taobao.com/user/structAddress"
     headers = {
         **WL_HEADERS,
@@ -714,6 +719,23 @@ def parse_refund_address(addr_str: str, session: requests.Session) -> dict:
         "townName": resp_data.get("town", ""),
         "divisionId": resp_data.get("divisionId", ""),
     }
+
+
+def is_valid_parsed_address(new_info: dict) -> bool:
+    """校验解析后的地址是否包含必要字段"""
+    if not new_info:
+        return False
+    # 收件人、电话、详细地址 缺一不可
+    if not new_info.get("contactName", "").strip():
+        return False
+    if not new_info.get("mobilePhone", "").strip():
+        return False
+    if not new_info.get("adr", "").strip():
+        return False
+    # 至少要有省或市
+    if not new_info.get("provinceName", "").strip() and not new_info.get("cityName", "").strip():
+        return False
+    return True
 
 
 # ==================== 淘宝订单与地址接口 ====================
@@ -845,9 +867,13 @@ def update_address(
 ) -> bool:
     url = "https://wuliu2.taobao.com/user/saveSellerContact.do"
 
-    contact_name = new_info.get("contactName") or original.get("contactName", "")
-    mobile = new_info.get("mobilePhone") or original.get("mobilePhone", "")
-    adr = new_info.get("adr") or original.get("adr", "")
+    # 收件人姓名/电话/地址必须以本次解析结果为准，禁止回落到旧地址数据
+    contact_name = (new_info.get("contactName") or "").strip()
+    mobile = (new_info.get("mobilePhone") or "").strip()
+    adr = (new_info.get("adr") or "").strip()
+    if not (contact_name and mobile and adr):
+        log_print("    [!] 解析结果缺少收件人姓名/电话/地址，拒绝覆盖地址")
+        return False
 
     provinceName = new_info.get("provinceName") or original.get("provinceName", "")
     cityName = new_info.get("cityName") or original.get("cityName", "")
@@ -1102,7 +1128,10 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
     for item in new_orders:
         check_stop()
         sid = str(item["targetShopId"])
-        addr = shop_address_map.get(sid, "暂无退货地址")
+        addr = shop_address_map.get(sid, "")
+        if not addr or not addr.strip():
+            log_print(f"    ⚠️ 供应商 shopId={sid} 无退货地址，跳过关联订单 tid={item['tid']}")
+            continue
         item["refund_address"] = addr
         final_result.append(item)
 
@@ -1261,12 +1290,17 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
     for idx, order in enumerate(ORDERS):
         check_stop()
         tid = order["tid"]
+        if str(tid) in filtered_tids:
+            continue
         refund_address = order["refund_address"]
+        matched = False
         for main_order in res_orders:
             check_stop()
 
             if str(tid) != str(main_order.get("id", 'unknown')):
                 continue
+
+            matched = True
 
             sub_orders = main_order.get("subOrders", [])
             if len(sub_orders) > 1:
@@ -1300,11 +1334,21 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
                 log_print(f"    [*] 订单 {tid} 状态颜色为 {expect_color}，跳过")
                 continue
 
-            new_info = parse_refund_address(refund_address, session)
-            if not new_info:
-                log_print(f"    [*] 订单 {tid} 识别地址失败，跳过")
+            # 先校验雀手原始地址是否为空
+            if not refund_address or not str(refund_address).strip():
+                log_print(f"    [*] 订单 {tid} 雀手未返回退货地址，跳过")
                 fail_count += 1
-                append_order_record(FAIL_FILE, tid, qn_username, reason='识别地址失败')
+                append_order_record(FAIL_FILE, tid, qn_username, reason='雀手未返回退货地址')
+                continue
+
+            new_info = parse_refund_address(refund_address, session)
+            if not is_valid_parsed_address(new_info):
+                log_print(f"    [*] 订单 {tid} 地址解析无效（缺少收件人/电话/地址），跳过")
+                log_print(f"        解析结果: contactName='{new_info.get('contactName', '')}', "
+                          f"mobilePhone='{new_info.get('mobilePhone', '')}', "
+                          f"adr='{new_info.get('adr', '')[:30]}'")
+                fail_count += 1
+                append_order_record(FAIL_FILE, tid, qn_username, reason='地址解析无效')
                 continue
 
             log_print("    [*] 解析 refund_address:")
@@ -1379,6 +1423,11 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
                 fail_count += 1
                 append_order_record(FAIL_FILE, tid, qn_username, reason='订单地址修改失败')
             safe_sleep(0.8)
+
+        if not matched:
+            log_print(f"    [!] 订单 {tid} 在批量查询结果中未找到，跳过")
+            fail_count += 1
+            append_order_record(FAIL_FILE, tid, qn_username, reason='批量查询未返回该订单')
 
     log_print(f"\n{'=' * 70}")
     log_print(
