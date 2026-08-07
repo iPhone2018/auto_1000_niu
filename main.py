@@ -1024,6 +1024,33 @@ def calc_mtop_sign(token: str, t_ms: str, appkey: str, data_raw: str) -> str:
     return hashlib.md5(sign_str.encode("utf-8")).hexdigest()
 
 
+def verify_order_return_address(session: requests.Session, tid: str, expect_address_id: str) -> tuple[bool, str]:
+    """
+    回查订单接口，校验订单实际生效退货addressId是否等于期望addressId
+    return: (是否校验通过, 诊断信息)
+    """
+    check_stop()
+    resp_data = query_order_by_tid(session, tid)
+    if not resp_data:
+        return False, "回查订单接口无返回"
+    main_orders = resp_data.get("mainOrders", [])
+    if not main_orders:
+        return False, "回查找不到该订单"
+    main_order = main_orders[0]
+    sub_orders = main_order.get("subOrders", [])
+    if len(sub_orders) != 1:
+        return False, "回查子订单数量异常"
+    sub = sub_orders[0]
+    rav = sub.get("returnAddressVO", {})
+    racv = rav.get("returnAddressContentVO", {})
+    real_addr_id = str(racv.get("addressId", ""))
+    expect = str(expect_address_id)
+    if real_addr_id == expect:
+        return True, f"校验通过，订单实际addressId={real_addr_id}"
+    else:
+        return False, f"校验不通过！期望addressId={expect},订单真实addressId={real_addr_id}"
+
+
 # ==================== 核心流程 ====================
 
 def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_password: str,
@@ -1430,15 +1457,35 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
                 cookie_jar,
                 json.dumps(data_content, ensure_ascii=False),
             )
-            if run_ok:
-                log_print(f"    [+] ✅ 订单 {tid} 操作成功")
+            # if run_ok:
+            #     log_print(f"    [+] ✅ 订单 {tid} 操作成功")
+            #     success_count += 1
+            #     append_order_record(SUCCESS_FILE, tid, qn_username, reason='修改成功')
+            # else:
+            #     log_print(f"    [!] ❌ 订单 {tid} 操作失败")
+            #     fail_count += 1
+            #     append_order_record(FAIL_FILE, tid, qn_username, reason='订单地址修改失败')
+            # safe_sleep(0.8)
+            if not run_ok:
+                log_print(f"    [!] ❌ 订单 {tid} mtop接口调用失败")
+                fail_count += 1
+                append_order_record(FAIL_FILE, tid, qn_username, reason='订单地址修改失败(mtop返回非成功)')
+                safe_sleep(0.8)
+                continue
+
+                # 接口返回成功，增加真实订单回查校验！
+            log_print(f"    [*] mtop接口返回成功，开始回查订单校验真实地址是否生效...")
+            verify_pass, verify_msg = verify_order_return_address(session, tid, new_address_id)
+            log_print(f"    [*] 校验结果: {verify_msg}")
+            if verify_pass:
+                log_print(f"    [+] ✅ 订单 {tid} 校验确认修改真正生效")
                 success_count += 1
                 append_order_record(SUCCESS_FILE, tid, qn_username, reason='修改成功')
             else:
-                log_print(f"    [!] ❌ 订单 {tid} 操作失败")
+                log_print(f"    [!] ❗警告：mtop接口返回成功，但订单实际地址未变更！tid={tid}")
                 fail_count += 1
-                append_order_record(FAIL_FILE, tid, qn_username, reason='订单地址修改失败')
-            safe_sleep(0.8)
+                append_order_record(FAIL_FILE, tid, qn_username, reason=f"mtop调用成功但地址未生效:{verify_msg}")
+            safe_sleep(1.2)
 
         if not matched:
             log_print(f"    [!] 订单 {tid} 在批量查询结果中未找到，跳过")
