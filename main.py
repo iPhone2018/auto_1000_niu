@@ -179,6 +179,21 @@ def save_one_account(acc_type: str, username: str, password: str):
     save_account_store(store)
 
 
+def save_qz_shop_name(qz_username: str, shop_name: str):
+    if not qz_username.strip():
+        return
+    store = load_account_store()
+    if "qz_shops" not in store:
+        store["qz_shops"] = {}
+    store["qz_shops"][qz_username.strip()] = shop_name.strip()
+    save_account_store(store)
+
+
+def get_qz_shop_name(qz_username: str) -> str:
+    store = load_account_store()
+    return store.get("qz_shops", {}).get(qz_username.strip(), "")
+
+
 # ==================== 执行记录文件管理 ====================
 SUCCESS_FILE = "success.txt"
 FAIL_FILE = "fail.txt"
@@ -275,7 +290,7 @@ def login(username: str, password: str):
         return False
 
 
-def get_shop_list():
+def get_shop_list(shop_name):
     shop_url = f"http://{QZ_HOST}/AutoOrder/getRelationUser"
     headers = {**BASE_HEADERS, "X-Requested-With": "XMLHttpRequest"}
     resp = session.get(shop_url, headers=headers, timeout=15)
@@ -289,7 +304,7 @@ def get_shop_list():
 
     shop_list = res_json.get("res", [])
     log_print(f"\n✅ 获取店铺总数：{len(shop_list)}")
-    shop_ids = [str(item["shopId"]) for item in shop_list]
+    shop_ids = [str(item["shopId"]) for item in shop_list if item.get("shopName", 'unKnown') == shop_name]
     log_print("所有shopId列表：" + str(shop_ids))
     return shop_ids
 
@@ -316,7 +331,7 @@ def get_trade_list(
         ("memoType", "seller"),
         ("buyerNick", ""),
         ("receiverMobile", ""),
-        ("status", ""),
+        ("status", "WAIT_BUYER_CONFIRM_GOODS"),
         ("targetOrderId", ""),
         ("waybillCode", ""),
         ("receiverInclude", "1"),
@@ -1012,7 +1027,8 @@ def calc_mtop_sign(token: str, t_ms: str, appkey: str, data_raw: str) -> str:
 # ==================== 核心流程 ====================
 
 def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_password: str,
-                     filtered_tids: set, start_date: str, end_date: str, instance_config: dict):
+                     filtered_tids: set, start_date: str, end_date: str, instance_config: dict,
+                     qz_shop_name: str = ""):
     global session, USERNAME, PASSWORD
     USERNAME = qn_username
     PASSWORD = qn_password
@@ -1026,7 +1042,7 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
         log_print("雀手登录失败！")
         return
 
-    shops = get_shop_list()
+    shops = get_shop_list(shop_name=qz_shop_name)
     if not shops:
         log_print("没有店铺！")
         return
@@ -1442,7 +1458,7 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("订单地址自动修改工具")
-        self.root.geometry("950x820")
+        self.root.geometry("1400x820")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         input_frame = ttk.Frame(root, padding=10)
@@ -1463,6 +1479,11 @@ class App:
         self.qz_pass = ttk.Entry(input_frame, width=30, show="*")
         self.qz_pass.grid(row=0, column=3, padx=5)
         self.qz_pass.insert(0, "qqq123123")
+
+        ttk.Label(input_frame, text="雀手店铺名称:").grid(row=0, column=4, sticky=tk.W, pady=3, padx=(15, 0))
+        self.qz_shop_var = tk.StringVar()
+        self.qz_shop = ttk.Combobox(input_frame, textvariable=self.qz_shop_var, width=22)
+        self.qz_shop.grid(row=0, column=5, padx=5)
 
         ttk.Label(input_frame, text="千牛账号:").grid(row=1, column=0, sticky=tk.W, pady=3)
         self.qn_user_var = tk.StringVar()
@@ -1521,12 +1542,16 @@ class App:
         self.instance_config = None
         self.prev_instance_config = None  # 用于跟踪上一个实例，切换账号时清理
         self.consume_log_queue()
+        self.qz_shop_var.set(get_qz_shop_name(self.qz_user_var.get().strip()))
 
     def on_qz_account_select(self, event):
         acc = self.qz_user_var.get().strip()
         pwd = self.acc_store["qz"].get(acc, "")
         self.qz_pass.delete(0, tk.END)
         self.qz_pass.insert(0, pwd)
+        # 新增：自动填充该账号上次用过的店铺名称
+        shop = get_qz_shop_name(acc)
+        self.qz_shop_var.set(shop)
 
     def on_qn_account_select(self, event):
         acc = self.qn_user_var.get().strip()
@@ -1566,6 +1591,7 @@ class App:
         self.acc_store = load_account_store()
         self.qz_user['values'] = list(self.acc_store["qz"].keys())
         self.qn_user['values'] = list(self.acc_store["qn"].keys())
+        self.qz_shop['values'] = list(self.acc_store.get("qz_shops", {}).values())
 
     def start_task(self):
         global g_user_chrome_path, INSTANCE_NAME
@@ -1579,6 +1605,7 @@ class App:
         qn_pwd = self.qn_pass.get().strip()
         save_one_account("qz", qz_acc, qz_pwd)
         save_one_account("qn", qn_acc, qn_pwd)
+        save_qz_shop_name(qz_acc, self.qz_shop_var.get().strip())
         self.refresh_account_combobox()
 
         # 【关键】如果已有旧实例（切换账号/重新执行），先彻底清理旧会话
@@ -1671,6 +1698,7 @@ class App:
             return
         qz_username = self.qz_user_var.get().strip()
         qz_password = self.qz_pass.get().strip()
+        qz_shop_name = self.qz_shop_var.get().strip()
         qn_username = self.qn_user_var.get().strip()
         qn_password = self.qn_pass.get().strip()
 
@@ -1689,7 +1717,8 @@ class App:
         log_print(f"[*] 本次查询日期范围: {start_date} ~ {end_date}")
 
         run_main_process(qz_username, qz_password, qn_username, qn_password,
-                         filtered_tids, start_date, end_date, self.instance_config)
+                         filtered_tids, start_date, end_date, self.instance_config,
+                         qz_shop_name)
 
         cleanup_old_records(SUCCESS_FILE)
         cleanup_old_records(FAIL_FILE)
