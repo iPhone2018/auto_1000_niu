@@ -739,30 +739,21 @@ def find_chrome_executable():
 
 
 def ensure_chrome_debugging(port: int, profile_dir: str) -> bool:
-    """确保 Chrome 调试端口可用。如果是已存在的 Chrome，验证是否属于本实例。"""
+    """确保 Chrome 调试端口可用。对齐 main_8.py 已验证的启动方式。"""
     marker_file = os.path.join(profile_dir, ".cdp_instance_marker")
 
     if is_port_open(port):
-        if _is_cdp_healthy(port):
-            # 验证这个 Chrome 是否是我们之前启动的（通过 marker 文件判断）
-            if os.path.exists(marker_file):
-                log_print(f"[*] 检测到 Chrome 调试端口 {port} 已开启且健康（本实例）")
-                return True
-            else:
-                # 端口上有健康的 CDP，但没有我们的 marker → 是其他程序的 Chrome
-                log_print(f"[!] 端口 {port} 上有其他程序的 Chrome，无法使用，尝试清理...")
-                _kill_chrome_by_port(port)
-                safe_sleep(2.0)
+        if os.path.exists(marker_file):
+            log_print(f"[*] 检测到 Chrome 调试端口 {port} 已开启（本实例）")
         else:
-            log_print(f"[!] 端口 {port} 被占用但 CDP 无响应，尝试清理...")
-            _kill_chrome_by_port(port)
-            safe_sleep(2.0)
+            log_print(f"[*] 检测到 Chrome 调试端口 {port} 已开启")
+        return True
 
     chrome_path = find_chrome_executable()
     if not chrome_path:
         log_print("[!] 未找到 Chrome，请在界面点击【选择】按钮指定chrome.exe，或手动启动：")
         if sys.platform == "darwin":
-            log_print(r'    /Applications/Google\ Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9222')
+            log_print(r'    /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222')
         elif sys.platform == "win32":
             log_print(r'    "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222')
             log_print(r'    .\chrome\chrome.exe --remote-debugging-port=9222')
@@ -771,19 +762,11 @@ def ensure_chrome_debugging(port: int, profile_dir: str) -> bool:
     log_print(f"[*] 尝试启动 Chrome（调试端口 {port}）...")
     os.makedirs(profile_dir, exist_ok=True)
 
-    # 清理上次崩溃残留的 SingletonLock（否则 Chrome 可能拒绝启动）
-    singleton_lock = os.path.join(profile_dir, "SingletonLock")
-    if os.path.exists(singleton_lock):
-        try:
-            os.remove(singleton_lock)
-            log_print("[*] 已清理残留的 SingletonLock")
-        except Exception:
-            pass
-
-    # 写入 marker 文件，用于后续验证 Chrome 属于本实例
+    # 写入 marker 文件（用于定时重复执行时识别本实例的 Chrome）
     with open(marker_file, "w", encoding="utf-8") as mf:
         mf.write(f"{port}\n{time.time()}\n")
 
+    # 对齐 main_8.py 的 Chrome 启动参数（已验证可稳定运行）
     cmd = [
         chrome_path,
         f"--remote-debugging-port={port}",
@@ -793,32 +776,17 @@ def ensure_chrome_debugging(port: int, profile_dir: str) -> bool:
         "--disable-metrics",
         "--disable-metrics-reporting",
         "--disable-logging",
-        "--no-sandbox",
-        "--disable-gpu",                     # 防止 GPU 进程崩溃导致 Chrome 闪退
-        "--disable-software-rasterizer",     # 禁用软件光栅化
-        "--disable-background-networking",
-        "--disable-sync",                    # 禁用同步，减少启动负担
-        "--disable-features=TranslateUI",    # 减少不必要功能
     ]
     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # 等待CDP稳定：必须连续3次检测健康，防止Chrome进程派生闪断端口
-    stable_ok = 0
-    for i in range(20):
+    for i in range(10):
         safe_sleep(1)
-        if is_port_open(port) and _is_cdp_healthy(port):
-            stable_ok += 1
-            log_print(f"    Chrome CDP检测正常 {stable_ok}/3 ({i + 1}/20)")
-            if stable_ok >= 3:
-                log_print("[+] Chrome CDP服务稳定就绪，启动成功")
-                return True
-        else:
-            stable_ok = 0
-            log_print(f"    等待 Chrome CDP就绪... ({i + 1}/20)")
+        if is_port_open(port):
+            log_print("[+] Chrome 启动成功")
+            return True
+        log_print(f"    等待 Chrome 就绪... ({i + 1}/10)")
 
-    log_print("[!] Chrome 启动后CDP服务未稳定就绪")
-    _kill_chrome_by_port(port)
-    # 启动失败，删除 marker 文件（避免下次误判）
+    log_print("[!] Chrome 启动后端口未就绪")
     try:
         os.remove(marker_file)
     except Exception:
@@ -1387,31 +1355,8 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
 
     with sync_playwright() as p:
         log_print("[*] 正在通过 CDP 连接到 Chrome...")
-        browser = None
-        connect_retry = 0
-        max_connect_retry = 5
-        while connect_retry < max_connect_retry:
-            check_stop()
-            try:
-                browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
-                log_print(f"[+] CDP连接成功，重试次数:{connect_retry}")
-                break
-            except Exception as e:
-                connect_retry += 1
-                log_print(f"[!] CDP连接失败 {connect_retry}/{max_connect_retry} : {str(e)}")
-                # Chrome 可能在 CDP 检测通过后崩溃 → 尝试重新拉起
-                if not _is_cdp_healthy(port):
-                    log_print(f"[!] 端口 {port} CDP 无响应，Chrome 可能已崩溃，尝试重新启动...")
-                    _kill_chrome_by_port(port)
-                    safe_sleep(1.5)
-                    if not ensure_chrome_debugging(port, profile_dir):
-                        log_print("[!] Chrome 重新启动失败")
-                        return
-                else:
-                    safe_sleep(1.5)
-        if browser is None:
-            log_print(f"[!] CDP多次连接失败，终止本实例")
-            return
+        browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        log_print("[+] CDP连接成功")
 
         if len(browser.contexts) == 0:
             log_print("[!] 未找到浏览器上下文")
