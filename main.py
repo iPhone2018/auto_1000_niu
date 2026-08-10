@@ -771,6 +771,15 @@ def ensure_chrome_debugging(port: int, profile_dir: str) -> bool:
     log_print(f"[*] 尝试启动 Chrome（调试端口 {port}）...")
     os.makedirs(profile_dir, exist_ok=True)
 
+    # 清理上次崩溃残留的 SingletonLock（否则 Chrome 可能拒绝启动）
+    singleton_lock = os.path.join(profile_dir, "SingletonLock")
+    if os.path.exists(singleton_lock):
+        try:
+            os.remove(singleton_lock)
+            log_print("[*] 已清理残留的 SingletonLock")
+        except Exception:
+            pass
+
     # 写入 marker 文件，用于后续验证 Chrome 属于本实例
     with open(marker_file, "w", encoding="utf-8") as mf:
         mf.write(f"{port}\n{time.time()}\n")
@@ -785,23 +794,27 @@ def ensure_chrome_debugging(port: int, profile_dir: str) -> bool:
         "--disable-metrics-reporting",
         "--disable-logging",
         "--no-sandbox",
+        "--disable-gpu",                     # 防止 GPU 进程崩溃导致 Chrome 闪退
+        "--disable-software-rasterizer",     # 禁用软件光栅化
         "--disable-background-networking",
+        "--disable-sync",                    # 禁用同步，减少启动负担
+        "--disable-features=TranslateUI",    # 减少不必要功能
     ]
     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # 等待CDP稳定：必须连续2次检测健康，防止Chrome进程派生闪断端口
+    # 等待CDP稳定：必须连续3次检测健康，防止Chrome进程派生闪断端口
     stable_ok = 0
-    for i in range(15):
+    for i in range(20):
         safe_sleep(1)
         if is_port_open(port) and _is_cdp_healthy(port):
             stable_ok += 1
-            log_print(f"    Chrome CDP检测正常 {stable_ok}/2 ({i + 1}/15)")
-            if stable_ok >= 2:
+            log_print(f"    Chrome CDP检测正常 {stable_ok}/3 ({i + 1}/20)")
+            if stable_ok >= 3:
                 log_print("[+] Chrome CDP服务稳定就绪，启动成功")
                 return True
         else:
             stable_ok = 0
-            log_print(f"    等待 Chrome CDP就绪... ({i + 1}/15)")
+            log_print(f"    等待 Chrome CDP就绪... ({i + 1}/20)")
 
     log_print("[!] Chrome 启动后CDP服务未稳定就绪")
     _kill_chrome_by_port(port)
@@ -1386,7 +1399,16 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
             except Exception as e:
                 connect_retry += 1
                 log_print(f"[!] CDP连接失败 {connect_retry}/{max_connect_retry} : {str(e)}")
-                safe_sleep(1.5)
+                # Chrome 可能在 CDP 检测通过后崩溃 → 尝试重新拉起
+                if not _is_cdp_healthy(port):
+                    log_print(f"[!] 端口 {port} CDP 无响应，Chrome 可能已崩溃，尝试重新启动...")
+                    _kill_chrome_by_port(port)
+                    safe_sleep(1.5)
+                    if not ensure_chrome_debugging(port, profile_dir):
+                        log_print("[!] Chrome 重新启动失败")
+                        return
+                else:
+                    safe_sleep(1.5)
         if browser is None:
             log_print(f"[!] CDP多次连接失败，终止本实例")
             return
