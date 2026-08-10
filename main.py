@@ -142,11 +142,52 @@ def log_print(text):
 
 # ==================== 账号存储工具函数（新增并发保护）====================
 
+# 端口注册表放在用户 HOME 目录下，确保同一台机器上多个程序副本（不同文件夹）共享
+_SHARED_REGISTRY_DIR = os.path.join(os.path.expanduser("~"), ".niu_port_registry")
+try:
+    os.makedirs(_SHARED_REGISTRY_DIR, exist_ok=True)
+except Exception:
+    _SHARED_REGISTRY_DIR = os.getcwd()  # HOME 不可写时回退到当前目录
+
+PORT_REGISTRY_FILE = os.path.join(_SHARED_REGISTRY_DIR, "registry.json")
+
 try:
     from filelock import FileLock
     _ACCOUNT_LOCK = FileLock(ACCOUNT_STORE_FILE + ".lock", timeout=5)
+    _PORT_LOCK = FileLock(os.path.join(_SHARED_REGISTRY_DIR, "port_alloc.lock"), timeout=30)
 except Exception:
     _ACCOUNT_LOCK = contextlib.nullcontext()
+    _PORT_LOCK = contextlib.nullcontext()
+
+
+def _load_port_registry():
+    """加载端口注册表（跨进程共享）"""
+    if not os.path.exists(PORT_REGISTRY_FILE):
+        return {}
+    try:
+        with open(PORT_REGISTRY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_port_registry(registry: dict):
+    """保存端口注册表"""
+    tmp_file = PORT_REGISTRY_FILE + ".tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump(registry, f, ensure_ascii=False)
+    if os.path.exists(PORT_REGISTRY_FILE):
+        os.replace(tmp_file, PORT_REGISTRY_FILE)
+    else:
+        os.rename(tmp_file, PORT_REGISTRY_FILE)
+
+
+def _unregister_port(port: int):
+    """从注册表中移除端口"""
+    with _PORT_LOCK:
+        registry = _load_port_registry()
+        registry.pop(str(port), None)
+        _save_port_registry(registry)
 
 
 def load_account_store():
@@ -459,21 +500,78 @@ def _close_chrome_via_cdp(port: int):
 
 
 def find_free_port(start_port: int = 9222, end_port: int = 9322) -> int:
-    for port in range(start_port, end_port + 1):
-        if not is_port_open(port):
-            log_print(f"[*] 分配调试端口: {port}")
-            return port
+    """跨进程安全地分配一个未使用的调试端口。
 
-        # 端口被占用，但 CDP 已死 → 强制释放
-        if not _is_cdp_healthy(port):
-            log_print(f"[!] 端口 {port} 被占用且 CDP 无响应，尝试释放...")
-            _kill_chrome_by_port(port)
-            safe_sleep(1.5)
+    通过文件锁 + 端口注册表确保：即使两个进程同时调用，也绝对不会分配到同一端口。
+    注册表记录的是「已预订但 Chrome 可能还未启动」的端口，弥补 OS 端口检查的竞态窗口。
+
+    宽限期机制：最近 REGISTRY_GRACE_SECONDS 秒内注册的端口视为「已被预订」，
+    即使 OS 端口尚未被占用（Chrome 还未启动），也不会被其他进程抢走。
+    """
+    REGISTRY_GRACE_SECONDS = 60  # 60 秒足够 Chrome 完成启动
+
+    with _PORT_LOCK:
+        registry = _load_port_registry()
+        now = time.time()
+
+        # 先清理过期僵尸（注册超时且端口实际空闲的记录）
+        stale_keys = []
+        for port_key, reg_time in list(registry.items()):
+            if now - reg_time > REGISTRY_GRACE_SECONDS:
+                try:
+                    p = int(port_key)
+                    if not is_port_open(p):
+                        stale_keys.append(port_key)
+                except ValueError:
+                    stale_keys.append(port_key)
+        for k in stale_keys:
+            registry.pop(k, None)
+        if stale_keys:
+            _save_port_registry(registry)
+
+        for port in range(start_port, end_port + 1):
+            port_key = str(port)
+
+            # 端口在注册表中且未超时 → 已被其他进程预订，跳过
+            if port_key in registry:
+                reg_time = registry[port_key]
+                if now - reg_time < REGISTRY_GRACE_SECONDS:
+                    log_print(f"[*] 端口 {port} 已被其他进程预订（{now - reg_time:.0f}秒前），跳过")
+                    continue
+                # 超时但端口仍被占用 → 已被正常使用，跳过
+                if is_port_open(port):
+                    continue
+                # 超时且端口空闲 → 僵尸记录，清理后可用
+                registry.pop(port_key, None)
+
+            # OS 端口空闲 → 立即预订
             if not is_port_open(port):
+                registry[port_key] = now
+                _save_port_registry(registry)
                 log_print(f"[*] 分配调试端口: {port}")
                 return port
 
-    raise RuntimeError(f"在 {start_port}-{end_port} 范围内未找到可用端口")
+            # 端口被占用，但 CDP 已死 → 强制释放（先释放锁再清理，避免阻塞其他进程）
+            if not _is_cdp_healthy(port):
+                log_print(f"[!] 端口 {port} 被占用且 CDP 无响应，尝试释放...")
+                # 释放锁 → 清理进程 → 短暂等待 → 重新加锁检查
+                # 注意：释放锁后另一个进程可能抢先注册此端口，所以需要重新验证
+                _save_port_registry(registry)  # 确保释放锁前保存当前状态
+                # 退出 with 块释放锁
+                break  # 跳出循环，在锁外处理
+        else:
+            # for 循环正常结束（遍历完所有端口都没找到可用的）
+            raise RuntimeError(f"在 {start_port}-{end_port} 范围内未找到可用端口")
+
+        # for 循环通过 break 退出 = 发现死 CDP 端口需要清理
+        # with 块即将退出释放锁，然后在锁外执行清理操作
+
+    # ---- 锁外：清理死 CDP 端口 ----
+    _kill_chrome_by_port(port)
+    time.sleep(1.0)
+
+    # 重新加锁，再次尝试分配（递归调用自身）
+    return find_free_port(start_port, end_port)
 
 
 def _kill_chrome_by_port(port: int):
@@ -484,53 +582,55 @@ def _kill_chrome_by_port(port: int):
         if sys.platform == "win32":
             result = subprocess.run(
                 f'netstat -ano | findstr :{port}',
-                shell=True, capture_output=True, text=True
+                shell=True, capture_output=True, text=True, timeout=10
             )
             pids = set()
             for line in result.stdout.splitlines():
-                if f":{port}" in line:
+                if f":{port}" in line and ("LISTENING" in line or "TIME_WAIT" in line):
                     parts = line.strip().split()
                     if len(parts) >= 5:
-                        pids.add(parts[-1])
+                        pid = parts[-1]
+                        if pid.isdigit():
+                            pids.add(pid)
 
-            # 杀掉每个 PID 及其子进程树（/T）
+            #杀掉每个PID进程树
             for pid in pids:
                 subprocess.run(
                     f'taskkill /T /F /PID {pid}',
-                    shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10
                 )
                 log_print(f"[*] 已强制结束 Chrome 进程树 PID:{pid} (端口 {port})")
-
-            # 兜底：如果还有残留，再扫一次
+            safe_sleep(1.2)
+            #兜底二次查杀
             if is_port_open(port):
                 subprocess.run(
-                    f'for /f "tokens=5" %a in (\'netstat -ano ^| findstr :{port}\') '
-                    f'do taskkill /T /F /PID %a 2>nul',
-                    shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    'wmic process where "name=\'chrome.exe\'" get ProcessId,CommandLine',
+                    shell=True,capture_output=True,text=True, timeout=10
                 )
         else:
             result = subprocess.run(
                 f"lsof -ti tcp:{port}",
-                shell=True, capture_output=True, text=True
+                shell=True, capture_output=True, text=True, timeout=10
             )
             for pid in result.stdout.strip().split():
                 if pid:
                     subprocess.run(
                         f"kill -9 {pid}",
-                        shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                        shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10
                     )
                     log_print(f"[*] 已强制结束 Chrome 进程 PID:{pid} (端口 {port})")
     except Exception as e:
         log_print(f"[!] 强制结束 Chrome 进程失败: {e}")
 
 
-def cleanup_instance(instance_config: dict, kill_browser: bool = True):
+def cleanup_instance(instance_config: dict, kill_browser: bool = True, release_port: bool = True):
     """
     清理实例资源：
     - 重置雀手 requests.Session（清空 cookies）
     - 关闭 Chrome 浏览器（CDP优雅关闭 → 强制kill降级）
     - 删除独立 Cookie 文件
     - 可选删除 Profile 目录（切换账号时彻底清理）
+    - release_port: 是否释放端口注册（定时重复执行时应为 False，保留端口防止被其他实例抢占）
     """
     global session
 
@@ -565,6 +665,12 @@ def cleanup_instance(instance_config: dict, kill_browser: bool = True):
         if not cdp_closed:
             _kill_chrome_by_port(port)
             safe_sleep(1.2)
+
+        # 是否从端口注册表中释放（定时重复执行时不释放，防止端口被抢占）
+        if release_port:
+            _unregister_port(port)
+        else:
+            log_print(f"[*] 保留端口 {port} 注册（定时重复执行，防止被其他实例抢占）")
 
     # 3. 删除 Cookie 文件
     if cookie_file and os.path.exists(cookie_file):
@@ -633,20 +739,30 @@ def find_chrome_executable():
 
 
 def ensure_chrome_debugging(port: int, profile_dir: str) -> bool:
+    """确保 Chrome 调试端口可用。如果是已存在的 Chrome，验证是否属于本实例。"""
+    marker_file = os.path.join(profile_dir, ".cdp_instance_marker")
+
     if is_port_open(port):
         if _is_cdp_healthy(port):
-            log_print(f"[*] 检测到 Chrome 调试端口 {port} 已开启且健康")
-            return True
+            # 验证这个 Chrome 是否是我们之前启动的（通过 marker 文件判断）
+            if os.path.exists(marker_file):
+                log_print(f"[*] 检测到 Chrome 调试端口 {port} 已开启且健康（本实例）")
+                return True
+            else:
+                # 端口上有健康的 CDP，但没有我们的 marker → 是其他程序的 Chrome
+                log_print(f"[!] 端口 {port} 上有其他程序的 Chrome，无法使用，尝试清理...")
+                _kill_chrome_by_port(port)
+                safe_sleep(2.0)
         else:
             log_print(f"[!] 端口 {port} 被占用但 CDP 无响应，尝试清理...")
             _kill_chrome_by_port(port)
-            safe_sleep(1.5)
+            safe_sleep(2.0)
 
     chrome_path = find_chrome_executable()
     if not chrome_path:
         log_print("[!] 未找到 Chrome，请在界面点击【选择】按钮指定chrome.exe，或手动启动：")
         if sys.platform == "darwin":
-            log_print(r'    /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222')
+            log_print(r'    /Applications/Google\ Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9222')
         elif sys.platform == "win32":
             log_print(r'    "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222')
             log_print(r'    .\chrome\chrome.exe --remote-debugging-port=9222')
@@ -654,6 +770,10 @@ def ensure_chrome_debugging(port: int, profile_dir: str) -> bool:
 
     log_print(f"[*] 尝试启动 Chrome（调试端口 {port}）...")
     os.makedirs(profile_dir, exist_ok=True)
+
+    # 写入 marker 文件，用于后续验证 Chrome 属于本实例
+    with open(marker_file, "w", encoding="utf-8") as mf:
+        mf.write(f"{port}\n{time.time()}\n")
 
     cmd = [
         chrome_path,
@@ -663,18 +783,33 @@ def ensure_chrome_debugging(port: int, profile_dir: str) -> bool:
         "--no-default-browser-check",
         "--disable-metrics",
         "--disable-metrics-reporting",
-        "--disable-logging"
+        "--disable-logging",
+        "--no-sandbox",
+        "--disable-background-networking",
     ]
     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    for i in range(10):
+    # 等待CDP稳定：必须连续2次检测健康，防止Chrome进程派生闪断端口
+    stable_ok = 0
+    for i in range(15):
         safe_sleep(1)
         if is_port_open(port) and _is_cdp_healthy(port):
-            log_print("[+] Chrome 启动成功")
-            return True
-        log_print(f"    等待 Chrome 就绪... ({i + 1}/10)")
+            stable_ok += 1
+            log_print(f"    Chrome CDP检测正常 {stable_ok}/2 ({i + 1}/15)")
+            if stable_ok >= 2:
+                log_print("[+] Chrome CDP服务稳定就绪，启动成功")
+                return True
+        else:
+            stable_ok = 0
+            log_print(f"    等待 Chrome CDP就绪... ({i + 1}/15)")
 
-    log_print("[!] Chrome 启动后端口未就绪")
+    log_print("[!] Chrome 启动后CDP服务未稳定就绪")
+    _kill_chrome_by_port(port)
+    # 启动失败，删除 marker 文件（避免下次误判）
+    try:
+        os.remove(marker_file)
+    except Exception:
+        pass
     return False
 
 
@@ -1239,7 +1374,22 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
 
     with sync_playwright() as p:
         log_print("[*] 正在通过 CDP 连接到 Chrome...")
-        browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        browser = None
+        connect_retry = 0
+        max_connect_retry = 5
+        while connect_retry < max_connect_retry:
+            check_stop()
+            try:
+                browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+                log_print(f"[+] CDP连接成功，重试次数:{connect_retry}")
+                break
+            except Exception as e:
+                connect_retry += 1
+                log_print(f"[!] CDP连接失败 {connect_retry}/{max_connect_retry} : {str(e)}")
+                safe_sleep(1.5)
+        if browser is None:
+            log_print(f"[!] CDP多次连接失败，终止本实例")
+            return
 
         if len(browser.contexts) == 0:
             log_print("[!] 未找到浏览器上下文")
@@ -1733,8 +1883,11 @@ class App:
 
         try:
             self.instance_config = get_instance_config(qn_acc)
-        except RuntimeError as e:
-            log_print(f"[!] {e}")
+        except Exception as e:
+            log_print(f"[!] 分配端口失败: {e}")
+            self.running = False
+            self.start_btn.config(state=tk.NORMAL)
+            self.stop_btn.config(state=tk.DISABLED)
             return
 
         self.root.title(
@@ -1845,9 +1998,9 @@ class App:
         cleanup_old_records(SUCCESS_FILE)
         cleanup_old_records(FAIL_FILE)
         log_print("\n[*] 本次执行完毕，已清理超30天的历史记录")
-        # 只关闭浏览器，保留实例配置，下一轮循环复用配置，不置空self.instance_config
+        # 只关闭浏览器，保留实例配置和端口注册，下一轮循环复用（防止端口被其他实例抢占）
         if self.instance_config:
-            cleanup_instance(self.instance_config, kill_browser=False)
+            cleanup_instance(self.instance_config, kill_browser=False, release_port=False)
 
 
 def main():
