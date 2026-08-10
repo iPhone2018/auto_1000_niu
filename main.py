@@ -435,16 +435,49 @@ def is_port_open(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _is_cdp_healthy(port: int, timeout: float = 3.0) -> bool:
+    """检查端口上的 Chrome CDP 是否真正响应，避免连到僵尸进程"""
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/json/version", method="GET"
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _close_chrome_via_cdp(port: int):
+    """独立函数，供线程池调用，避免在主线程阻塞 GUI"""
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+            browser.close()
+    except Exception:
+        pass
+
+
 def find_free_port(start_port: int = 9222, end_port: int = 9322) -> int:
     for port in range(start_port, end_port + 1):
         if not is_port_open(port):
             log_print(f"[*] 分配调试端口: {port}")
             return port
+
+        # 端口被占用，但 CDP 已死 → 强制释放
+        if not _is_cdp_healthy(port):
+            log_print(f"[!] 端口 {port} 被占用且 CDP 无响应，尝试释放...")
+            _kill_chrome_by_port(port)
+            safe_sleep(1.5)
+            if not is_port_open(port):
+                log_print(f"[*] 分配调试端口: {port}")
+                return port
+
     raise RuntimeError(f"在 {start_port}-{end_port} 范围内未找到可用端口")
 
 
 def _kill_chrome_by_port(port: int):
-    """通过端口查找并强制结束对应的 Chrome 进程"""
+    """通过端口查找并强制结束对应的 Chrome 进程及其子进程"""
     if not is_port_open(port):
         return
     try:
@@ -453,29 +486,40 @@ def _kill_chrome_by_port(port: int):
                 f'netstat -ano | findstr :{port}',
                 shell=True, capture_output=True, text=True
             )
+            pids = set()
             for line in result.stdout.splitlines():
-                if f"127.0.0.1:{port}" in line or f"0.0.0.0:{port}" in line:
+                if f":{port}" in line:
                     parts = line.strip().split()
                     if len(parts) >= 5:
-                        pid = parts[-1]
-                        subprocess.run(
-                            f'taskkill /F /PID {pid}',
-                            shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                        )
-                        log_print(f"[*] 已强制结束 Chrome 进程 PID:{pid} (端口 {port})")
-                        break
+                        pids.add(parts[-1])
+
+            # 杀掉每个 PID 及其子进程树（/T）
+            for pid in pids:
+                subprocess.run(
+                    f'taskkill /T /F /PID {pid}',
+                    shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                log_print(f"[*] 已强制结束 Chrome 进程树 PID:{pid} (端口 {port})")
+
+            # 兜底：如果还有残留，再扫一次
+            if is_port_open(port):
+                subprocess.run(
+                    f'for /f "tokens=5" %a in (\'netstat -ano ^| findstr :{port}\') '
+                    f'do taskkill /T /F /PID %a 2>nul',
+                    shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
         else:
             result = subprocess.run(
                 f"lsof -ti tcp:{port}",
                 shell=True, capture_output=True, text=True
             )
-            pid = result.stdout.strip()
-            if pid:
-                subprocess.run(
-                    f"kill -9 {pid}",
-                    shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-                log_print(f"[*] 已强制结束 Chrome 进程 PID:{pid} (端口 {port})")
+            for pid in result.stdout.strip().split():
+                if pid:
+                    subprocess.run(
+                        f"kill -9 {pid}",
+                        shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+                    log_print(f"[*] 已强制结束 Chrome 进程 PID:{pid} (端口 {port})")
     except Exception as e:
         log_print(f"[!] 强制结束 Chrome 进程失败: {e}")
 
@@ -502,17 +546,25 @@ def cleanup_instance(instance_config: dict, kill_browser: bool = True):
     cookie_file = instance_config.get("cookie_file")
     profile_dir = instance_config.get("profile_dir")
 
-    # 2. 关闭 Chrome（千牛）
+    # 2. 关闭 Chrome（千牛）—— 带超时，避免无限挂起
     if port and is_port_open(port):
+        cdp_closed = False
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
-                browser.close()
-                log_print(f"[*] 已通过 CDP 关闭 Chrome (端口 {port})")
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_close_chrome_via_cdp, port)
+                try:
+                    future.result(timeout=5)
+                    log_print(f"[*] 已通过 CDP 关闭 Chrome (端口 {port})")
+                    cdp_closed = True
+                except concurrent.futures.TimeoutError:
+                    log_print(f"[!] CDP 关闭 Chrome 超时（5秒），将强制结束进程")
         except Exception as e:
-            log_print(f"[!] CDP 关闭 Chrome 失败，尝试强制结束: {e}")
+            log_print(f"[!] CDP 关闭 Chrome 失败: {e}")
+
+        if not cdp_closed:
             _kill_chrome_by_port(port)
-            safe_sleep(1.2) # 新增：kill进程后等待释放文件句柄，Windows必要
+            safe_sleep(1.2)
 
     # 3. 删除 Cookie 文件
     if cookie_file and os.path.exists(cookie_file):
@@ -528,7 +580,6 @@ def cleanup_instance(instance_config: dict, kill_browser: bool = True):
             shutil.rmtree(profile_dir)
             log_print(f"[*] 已清理 Profile 目录: {profile_dir}")
         except PermissionError as e:
-            # Windows：进程残留持有BrowserMetrics‑xxx.pma句柄，捕获WinError5拒绝访问，不阻断程序
             log_print(f"[!] Profile目录被进程占用，跳过本次删除(WinError5): {e}")
         except Exception as e:
             log_print(f"[!] 清理 Profile 目录失败: {e}")
@@ -583,8 +634,13 @@ def find_chrome_executable():
 
 def ensure_chrome_debugging(port: int, profile_dir: str) -> bool:
     if is_port_open(port):
-        log_print(f"[*] 检测到 Chrome 调试端口 {port} 已开启")
-        return True
+        if _is_cdp_healthy(port):
+            log_print(f"[*] 检测到 Chrome 调试端口 {port} 已开启且健康")
+            return True
+        else:
+            log_print(f"[!] 端口 {port} 被占用但 CDP 无响应，尝试清理...")
+            _kill_chrome_by_port(port)
+            safe_sleep(1.5)
 
     chrome_path = find_chrome_executable()
     if not chrome_path:
@@ -605,15 +661,15 @@ def ensure_chrome_debugging(port: int, profile_dir: str) -> bool:
         f"--user-data-dir={profile_dir}",
         "--no-first-run",
         "--no-default-browser-check",
-        "--disable-metrics",          # 新增：关闭BrowserMetrics *.pma文件生成
-        "--disable-metrics-reporting", # 新增
-        "--disable-logging"            # 新增：减少profile内生成日志文件
+        "--disable-metrics",
+        "--disable-metrics-reporting",
+        "--disable-logging"
     ]
     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     for i in range(10):
         safe_sleep(1)
-        if is_port_open(port):
+        if is_port_open(port) and _is_cdp_healthy(port):
             log_print("[+] Chrome 启动成功")
             return True
         log_print(f"    等待 Chrome 就绪... ({i + 1}/10)")
@@ -1289,9 +1345,11 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
         log_print(f"[!] 加载 Cookie 失败: {e}")
         return
 
-    session = requests.Session()
-    session.cookies.update(cookie_jar)
-    log_print(f"[*] 已加载 Cookie，Session 中共有 {len(session.cookies)} 条")
+    # 使用独立的 tb_session，避免覆盖全局雀手 session
+    tb_session = requests.Session()
+    tb_session.cookies.update(cookie_jar)
+    log_print(f"[*] 已加载 Cookie，Session 中共有 {len(tb_session.cookies)} 条")
+
     mode_text = "【覆盖第3条地址】" if RUN_MODE == 0 else "【每条订单新建独立地址】"
     log_print(f"[*] 当前运行模式: {mode_text}")
 
@@ -1655,17 +1713,21 @@ class App:
         save_qz_shop_name(qz_acc, self.qz_shop_var.get().strip())
         self.refresh_account_combobox()
 
-        # 【关键】如果已有旧实例（切换账号/重新执行），先彻底清理旧会话
+        # 【关键】如果已有旧实例（切换账号/重新执行），先彻底清理旧会话（后台线程，不卡 GUI）
         if self.instance_config:
-            log_print("[*] 检测到已有实例，正在清理旧会话...")
-            cleanup_instance(self.instance_config, kill_browser=True)
+            log_print("[*] 检测到已有实例，正在后台清理旧会话...")
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(cleanup_instance, self.instance_config, True)
+                try:
+                    future.result(timeout=8)
+                except concurrent.futures.TimeoutError:
+                    log_print("[!] 清理旧会话超时，将继续启动新实例")
             self.prev_instance_config = self.instance_config
             self.instance_config = None
 
-        # 【关键】设置实例标识，用于日志前缀和窗口标题
         INSTANCE_NAME = qn_acc
 
-        # 【关键】为当前实例分配独立端口、Profile、Cookie文件
         try:
             self.instance_config = get_instance_config(qn_acc)
         except RuntimeError as e:
@@ -1702,9 +1764,18 @@ class App:
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         log_print("\n[!] 已发送停止信号，正在中断当前操作并清理会话...")
-        # 【关键】停止时彻底清理雀手+千牛会话
-        cleanup_instance(self.instance_config, kill_browser=True)
-        self.instance_config = None
+
+        # 【关键】停止时后台清理，不卡 GUI
+        if self.instance_config:
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(cleanup_instance, self.instance_config, True)
+                try:
+                    future.result(timeout=8)
+                except concurrent.futures.TimeoutError:
+                    log_print("[!] 清理会话超时")
+            self.instance_config = None
+
         log_print("[*] 会话清理完成\n")
 
     def run_loop(self):
