@@ -1271,26 +1271,29 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
             log_print(f"[+] 找到登录框: {source}")
 
             try:
-                tab = login_frame.locator(".password-login-tab-item")
+                tab = page.locator(".password-login-tab-item")
                 if tab.count() > 0 and tab.is_visible():
-                    tab.click()
+                    tab.click(timeout=10000)
                     safe_sleep(1)
                     log_print("[+] 已切换到密码登录方式")
             except Exception:
                 pass
 
             log_print("[*] 输入账号...")
-            login_frame.fill("#fm-login-id", USERNAME)
+            page.locator("#fm-login-id").fill(USERNAME)
             safe_sleep(1.5)
             check_stop()
 
             log_print("[*] 输入密码...")
-            login_frame.fill("#fm-login-password", PASSWORD)
+            page.locator("#fm-login-password").fill(PASSWORD)
             safe_sleep(1)
             check_stop()
 
             log_print("[*] 点击登录按钮...")
-            login_frame.click(".fm-submit.password-login")
+            try:
+                page.locator(".fm-submit.password-login").click(timeout=20000)
+            except Exception as e:
+                log_print(f"[*] 点击登录按钮检测到iframe卸载: {str(e)}，页面正在跳转，继续等待登录结果")
             safe_sleep(3)
             check_stop()
 
@@ -1688,8 +1691,8 @@ class App:
     def on_close(self):
         self.stop_task()
         # 窗口关闭时彻底清理所有资源
-        cleanup_instance(self.instance_config, kill_browser=True)
-        self.instance_config = None
+        if self.instance_config:
+            cleanup_instance(self.instance_config, kill_browser=True)
         self.root.destroy()
 
     def refresh_account_combobox(self):
@@ -1806,9 +1809,10 @@ class App:
             self.running = False
             self.start_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
-            # 【关键】单次执行完毕或停止后，清理会话避免Cookie残留
-            cleanup_instance(self.instance_config, kill_browser=True)
-            self.instance_config = None
+            # 只有任务完全停止，才彻底清理实例
+            if self.instance_config:
+                cleanup_instance(self.instance_config, kill_browser=True)
+                self.instance_config = None
             log_print("\n[*] 定时任务已完全停止，会话已清理\n")
 
     def execute_once(self):
@@ -1841,9 +1845,9 @@ class App:
         cleanup_old_records(SUCCESS_FILE)
         cleanup_old_records(FAIL_FILE)
         log_print("\n[*] 本次执行完毕，已清理超30天的历史记录")
-        # 【关键】单次执行完毕后清理会话，避免切换账号时Cookie串用
-        cleanup_instance(self.instance_config, kill_browser=True)
-        self.instance_config = None
+        # 只关闭浏览器，保留实例配置，下一轮循环复用配置，不置空self.instance_config
+        if self.instance_config:
+            cleanup_instance(self.instance_config, kill_browser=False)
 
 
 def main():
