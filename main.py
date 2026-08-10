@@ -762,6 +762,16 @@ def ensure_chrome_debugging(port: int, profile_dir: str) -> bool:
     log_print(f"[*] 尝试启动 Chrome（调试端口 {port}）...")
     os.makedirs(profile_dir, exist_ok=True)
 
+    # 清理上次崩溃残留的锁文件（否则 Chrome 可能启动后立即闪退）
+    for lock_name in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
+        lock_path = os.path.join(profile_dir, lock_name)
+        if os.path.exists(lock_path):
+            try:
+                os.remove(lock_path)
+                log_print(f"[*] 已清理残留的 {lock_name}")
+            except Exception:
+                pass
+
     # 写入 marker 文件（用于定时重复执行时识别本实例的 Chrome）
     with open(marker_file, "w", encoding="utf-8") as mf:
         mf.write(f"{port}\n{time.time()}\n")
@@ -777,16 +787,31 @@ def ensure_chrome_debugging(port: int, profile_dir: str) -> bool:
         "--disable-metrics-reporting",
         "--disable-logging",
     ]
-    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # 捕获 Chrome 的 stderr 用于诊断闪退原因
+    stderr_log = os.path.join(profile_dir, "chrome_stderr.log")
+    with open(stderr_log, "w") as err_f:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err_f)
 
     for i in range(10):
         safe_sleep(1)
         if is_port_open(port):
             log_print("[+] Chrome 启动成功")
+            # Chrome 刚启动时可能还不稳定，额外等 2 秒再交还给调用方
+            safe_sleep(2)
             return True
         log_print(f"    等待 Chrome 就绪... ({i + 1}/10)")
 
+    # 启动失败，输出 Chrome 的 stderr 帮助诊断
     log_print("[!] Chrome 启动后端口未就绪")
+    if os.path.exists(stderr_log):
+        try:
+            with open(stderr_log, "r") as err_f:
+                err_content = err_f.read().strip()
+                if err_content:
+                    log_print(f"[!] Chrome stderr 输出:\n{err_content[:1000]}")
+        except Exception:
+            pass
     try:
         os.remove(marker_file)
     except Exception:
@@ -1355,8 +1380,45 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
 
     with sync_playwright() as p:
         log_print("[*] 正在通过 CDP 连接到 Chrome...")
-        browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
-        log_print("[+] CDP连接成功")
+        try:
+            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+            log_print("[+] CDP连接成功")
+        except Exception as e:
+            log_print(f"[!] CDP连接失败: {e}")
+            # 诊断：检查 Chrome 是否已经闪退
+            if not is_port_open(port):
+                log_print("[!] 端口已关闭，Chrome 已闪退")
+                # 读取 Chrome stderr 诊断原因
+                stderr_log = os.path.join(profile_dir, "chrome_stderr.log")
+                if os.path.exists(stderr_log):
+                    try:
+                        with open(stderr_log, "r", encoding="utf-8", errors="replace") as err_f:
+                            err_content = err_f.read().strip()
+                            if err_content:
+                                log_print(f"[!] Chrome stderr:\n{err_content[:1500]}")
+                    except Exception:
+                        pass
+                # 尝试用全新 profile 重试一次
+                log_print("[*] 删除旧 Profile 并使用全新 Profile 重试...")
+                _kill_chrome_by_port(port)
+                safe_sleep(1.5)
+                try:
+                    shutil.rmtree(profile_dir)
+                except Exception:
+                    pass
+                os.makedirs(profile_dir, exist_ok=True)
+                if not ensure_chrome_debugging(port, profile_dir):
+                    log_print("[!] 重试仍失败，终止本实例")
+                    return
+                try:
+                    browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+                    log_print("[+] 重试后 CDP连接成功")
+                except Exception as e2:
+                    log_print(f"[!] 重试后 CDP连接仍失败: {e2}")
+                    return
+            else:
+                log_print("[!] 端口仍开放但 CDP 连接失败，请检查 Chrome 版本是否与 Playwright 兼容")
+                return
 
         if len(browser.contexts) == 0:
             log_print("[!] 未找到浏览器上下文")
