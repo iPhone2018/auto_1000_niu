@@ -903,20 +903,12 @@ def is_logged_in(page) -> tuple[bool, str]:
     # 首要判断：首页"交易"导航按钮是否出现（最可靠的登录成功标志）
     try:
         trade_btn = page.locator('[role="button"]').filter(has_text="交易")
-        if trade_btn.count() < 0:
-            return False, "首页'交易'按钮未出现，需要等待"
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
+        if trade_btn.count() > 0:
+            return True, "首页'交易'按钮已出现，登录成功"
+    except Exception:
+        pass
 
-    # # 兜底：已有的标题和元素判断
-    # try:
-    #     title = page.title()
-    #     if "工作台" in title or "千牛" in title or "卖家中心" in title:
-    #         return True, f"登录框消失且标题为: {title}"
-    # except Exception:
-    #     pass
-
+    # 兜底：工作台元素判断
     try:
         selectors = [
             ".workbench-container",
@@ -928,10 +920,10 @@ def is_logged_in(page) -> tuple[bool, str]:
             if page.locator(sel).count() > 0:
                 return True, f"登录框消失且出现工作台元素: {sel}"
     except Exception:
-        import traceback
-        traceback.print_exc()
+        pass
 
-    return True, "登录框已消失（可能已登录，正在加载）"
+    # 登录框消失但无任何正面信号 → 可能处于滑块/短信验证码等中间页面，继续等待
+    return False, "登录框已消失，等待首页元素加载..."
 
 
 def get_unique_cookies(cookies: list) -> list:
