@@ -677,14 +677,16 @@ def _kill_chrome_by_port(port: int):
         log_print(f"[!] 强制结束 Chrome 进程失败: {e}")
 
 
-def cleanup_instance(instance_config: dict, kill_browser: bool = True, release_port: bool = True):
+def cleanup_instance(instance_config: dict, kill_browser: bool = True, release_port: bool = True,
+                     close_browser: bool = True):
     """
     清理实例资源：
     - 重置雀手 requests.Session（清空 cookies）
     - 关闭 Chrome 浏览器（CDP优雅关闭 → 强制kill降级）
     - 删除独立 Cookie 文件
     - 可选删除 Profile 目录（切换账号时彻底清理）
-    - release_port: 是否释放端口注册（定时重复执行时应为 False，保留端口防止被其他实例抢占）
+    - release_port: 是否释放端口注册
+    - close_browser: 是否关闭浏览器（定时重复执行时应为 False，保持登录态）
     """
     global session
 
@@ -701,7 +703,7 @@ def cleanup_instance(instance_config: dict, kill_browser: bool = True, release_p
     profile_dir = instance_config.get("profile_dir")
 
     # 2. 关闭 Chrome（千牛）—— 带超时，避免无限挂起
-    if port and is_port_open(port):
+    if close_browser and port and is_port_open(port):
         cdp_closed = False
         try:
             import concurrent.futures
@@ -720,14 +722,17 @@ def cleanup_instance(instance_config: dict, kill_browser: bool = True, release_p
             _kill_chrome_by_port(port)
             safe_sleep(1.2)
 
-        # 是否从端口注册表中释放（定时重复执行时不释放，防止端口被抢占）
+        # 是否从端口注册表中释放
         if release_port:
             _unregister_port(port)
         else:
-            log_print(f"[*] 保留端口 {port} 注册（定时重复执行，防止被其他实例抢占）")
+            log_print(f"[*] 保留端口 {port} 注册")
 
-    # 3. 删除 Cookie 文件
-    if cookie_file and os.path.exists(cookie_file):
+    if not close_browser:
+        log_print(f"[*] 保持浏览器运行（端口 {port}），复用登录态")
+
+    # 3. 删除 Cookie 文件（仅在关闭浏览器时删除，否则保留供下次复用）
+    if close_browser and cookie_file and os.path.exists(cookie_file):
         try:
             os.remove(cookie_file)
             log_print(f"[*] 已删除 Cookie 文件: {cookie_file}")
@@ -798,10 +803,16 @@ def ensure_chrome_debugging(port: int, profile_dir: str) -> bool:
 
     if is_port_open(port):
         if os.path.exists(marker_file):
-            log_print(f"[*] 检测到 Chrome 调试端口 {port} 已开启（本实例）")
+            log_print(f"[*] 复用已登录的浏览器（端口 {port}）")
         else:
             log_print(f"[*] 检测到 Chrome 调试端口 {port} 已开启")
         return True
+
+    # 端口未开放 → 浏览器被关闭或从未启动，需要重新拉起
+    if os.path.exists(marker_file):
+        log_print(f"[*] 浏览器已被关闭，重新启动并复用 Profile（端口 {port}）...")
+    else:
+        log_print(f"[*] 首次启动 Chrome（调试端口 {port}）...")
 
     chrome_path = find_chrome_executable()
     if not chrome_path:
@@ -1520,7 +1531,10 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
         if logged:
             log_print(f"[+] 检测到已是登录状态！({reason})")
         else:
-            log_print(f"[*] 未登录，开始自动填充账号密码... ({reason})")
+            if "仍存在登录框" in reason:
+                log_print(f"[*] Cookie 已过期或未登录，需要重新登录 ({reason})")
+            else:
+                log_print(f"[*] 未登录，开始自动填充账号密码... ({reason})")
 
             login_frame, source = find_login_frame(page)
             if not login_frame:
@@ -2104,9 +2118,10 @@ class App:
         cleanup_old_records(SUCCESS_FILE)
         cleanup_old_records(FAIL_FILE)
         log_print("\n[*] 本次执行完毕，已清理超30天的历史记录")
-        # 只关闭浏览器，保留实例配置和端口注册，下一轮循环复用（防止端口被其他实例抢占）
+        # 保持浏览器运行和端口注册，下一轮循环直接复用已登录的浏览器
         if self.instance_config:
-            cleanup_instance(self.instance_config, kill_browser=False, release_port=False)
+            cleanup_instance(self.instance_config, kill_browser=False, release_port=False,
+                             close_browser=False)
 
 
 def main():
