@@ -903,10 +903,11 @@ def is_logged_in(page) -> tuple[bool, str]:
     # 首要判断：首页"交易"导航按钮是否出现（最可靠的登录成功标志）
     try:
         trade_btn = page.locator('[role="button"]').filter(has_text="交易")
-        if trade_btn.count() > 0:
-            return True, "首页'交易'按钮已出现，登录成功"
-    except Exception:
-        pass
+        if trade_btn.count() < 0:
+            return False, "首页'交易'按钮未出现，需要等待"
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
 
     # # 兜底：已有的标题和元素判断
     # try:
@@ -927,7 +928,8 @@ def is_logged_in(page) -> tuple[bool, str]:
             if page.locator(sel).count() > 0:
                 return True, f"登录框消失且出现工作台元素: {sel}"
     except Exception:
-        pass
+        import traceback
+        traceback.print_exc()
 
     return True, "登录框已消失（可能已登录，正在加载）"
 
