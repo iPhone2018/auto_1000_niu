@@ -517,7 +517,7 @@ def _safe_rmtree_profile(profile_dir: str):
         log_print(f"[!] 清理 Profile 目录失败: {e}")
 
 
-def find_free_port(start_port: int = 9222, end_port: int = 9322) -> int:
+def find_free_port(start_port: int = 9222, end_port: int = 9322, _depth: int = 0) -> int:
     """跨进程安全地分配一个未使用的调试端口。
 
     通过文件锁 + 端口注册表确保：即使两个进程同时调用，也绝对不会分配到同一端口。
@@ -526,6 +526,8 @@ def find_free_port(start_port: int = 9222, end_port: int = 9322) -> int:
     宽限期机制：最近 REGISTRY_GRACE_SECONDS 秒内注册的端口视为「已被预订」，
     即使 OS 端口尚未被占用（Chrome 还未启动），也不会被其他进程抢走。
     """
+    if _depth > 5:
+        raise RuntimeError(f"端口分配重试次数超限（{_depth}），请检查端口 {start_port}-{end_port} 是否被非 Chrome 进程占用")
     REGISTRY_GRACE_SECONDS = 60  # 60 秒足够 Chrome 完成启动
 
     with _PORT_LOCK:
@@ -588,8 +590,8 @@ def find_free_port(start_port: int = 9222, end_port: int = 9322) -> int:
     _kill_chrome_by_port(port)
     time.sleep(1.0)
 
-    # 重新加锁，再次尝试分配（递归调用自身）
-    return find_free_port(start_port, end_port)
+    # 重新加锁，再次尝试分配
+    return find_free_port(start_port, end_port, _depth + 1)
 
 
 def _kill_chrome_by_port(port: int):
@@ -604,12 +606,7 @@ def _kill_chrome_by_port(port: int):
         return
     try:
         if sys.platform == "win32":
-            # netstat -ano 输出格式: "  TCP    127.0.0.1:9222    0.0.0.0:0    LISTENING    12345"
-            result = subprocess.run(
-                f'netstat -ano | findstr ":9222 "',
-                shell=True, capture_output=True, text=True, timeout=10
-            )
-            # 降低误匹配：直接查指定端口
+            # 精确搜索端口号（/C: 表示精确字符串匹配，":{port} " 避免误匹配 :92220）
             result = subprocess.run(
                 f'netstat -ano | findstr /C:":{port} "',
                 shell=True, capture_output=True, text=True, timeout=10
