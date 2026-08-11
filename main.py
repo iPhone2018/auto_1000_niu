@@ -1216,9 +1216,32 @@ def update_address(
     try:
         result = resp.json()
         log_print(f"    [*] 响应: {json.dumps(result, ensure_ascii=False)}")
-        return result.get("success", False) is True
+        if result.get("success", False):
+            return True
+        # 首次失败：地址校验不通过，尝试 ignoreCheck=true 跳过校验再请求一次
+        log_print("    [*] 首次提交失败，尝试 ignoreCheck=true 重试...")
     except Exception as e:
         log_print(f"    [!] 解析响应失败: {e}")
+        log_print(f"        响应文本: {resp.text[:500]}")
+        return False
+
+    # 重试：ignoreCheck=true 跳过地址规范校验
+    data["ignoreCheck"] = "true"
+    try:
+        resp = session.post(url, data=data, headers=headers, timeout=30)
+        safe_sleep(1)
+        check_stop()
+    except Exception as e:
+        log_print(f"    [!] 重试请求异常: {e}")
+        return False
+
+    log_print(f"    [*] 重试 saveSellerContact 状态码: {resp.status_code}")
+    try:
+        result = resp.json()
+        log_print(f"    [*] 重试响应: {json.dumps(result, ensure_ascii=False)}")
+        return result.get("success", False) is True
+    except Exception as e:
+        log_print(f"    [!] 重试解析响应失败: {e}")
         log_print(f"        响应文本: {resp.text[:500]}")
         return False
 
