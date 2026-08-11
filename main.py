@@ -1513,20 +1513,17 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
                 pass
 
             log_print("[*] 输入账号...")
-            page.locator("#fm-login-id").fill(USERNAME)
+            login_frame.fill("#fm-login-id", USERNAME)
             safe_sleep(1.5)
             check_stop()
 
             log_print("[*] 输入密码...")
-            page.locator("#fm-login-password").fill(PASSWORD)
+            login_frame.fill("#fm-login-password", PASSWORD)
             safe_sleep(1)
             check_stop()
 
             log_print("[*] 点击登录按钮...")
-            try:
-                page.locator(".fm-submit.password-login").click(timeout=20000)
-            except Exception as e:
-                log_print(f"[*] 点击登录按钮检测到iframe卸载: {str(e)}，页面正在跳转，继续等待登录结果")
+            login_frame.click(".fm-submit.password-login")
             safe_sleep(3)
             check_stop()
 
