@@ -1587,10 +1587,10 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
         log_print(f"[!] 加载 Cookie 失败: {e}")
         return
 
-    # 使用独立的 tb_session，避免覆盖全局雀手 session
-    tb_session = requests.Session()
-    tb_session.cookies.update(cookie_jar)
-    log_print(f"[*] 已加载 Cookie，Session 中共有 {len(tb_session.cookies)} 条")
+    # 加载淘宝 Cookie 到全局 session，后续淘宝 API 调用统一使用
+    session.cookies.clear()
+    session.cookies.update(cookie_jar)
+    log_print(f"[*] 已加载 Cookie，Session 中共有 {len(session.cookies)} 条")
 
     mode_text = "【覆盖第3条地址】" if RUN_MODE == 0 else "【每条订单新建独立地址】"
     log_print(f"[*] 当前运行模式: {mode_text}")
