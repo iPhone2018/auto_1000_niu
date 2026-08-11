@@ -499,6 +499,24 @@ def _close_chrome_via_cdp(port: int):
         pass
 
 
+def _safe_rmtree_profile(profile_dir: str):
+    """安全删除 Profile 目录。仅当路径包含 playwright_chrome_profile 标记时才执行，
+    防止误删系统目录。"""
+    if not profile_dir or not os.path.isabs(profile_dir):
+        return
+    # 安全检查：必须包含 playwright_chrome_profile 标记
+    norm = os.path.normpath(profile_dir)
+    if "playwright_chrome_profile" not in norm:
+        log_print(f"[!] 安全拦截：拒绝删除非 Playwright Profile 目录: {norm}")
+        return
+    try:
+        shutil.rmtree(norm)
+    except PermissionError as e:
+        log_print(f"[!] Profile目录被进程占用，跳过本次删除: {e}")
+    except Exception as e:
+        log_print(f"[!] 清理 Profile 目录失败: {e}")
+
+
 def find_free_port(start_port: int = 9222, end_port: int = 9322) -> int:
     """跨进程安全地分配一个未使用的调试端口。
 
@@ -575,39 +593,78 @@ def find_free_port(start_port: int = 9222, end_port: int = 9322) -> int:
 
 
 def _kill_chrome_by_port(port: int):
-    """通过端口查找并强制结束对应的 Chrome 进程及其子进程"""
+    """安全地结束指定端口上的 Chrome 调试进程。
+
+    多重保护：
+    1. 精确端口匹配（防止 :9222 误匹配 :92220）
+    2. 进程名验证（只杀 chrome.exe，不杀其他应用）
+    3. 先优雅关闭，失败再强制结束
+    """
     if not is_port_open(port):
         return
     try:
         if sys.platform == "win32":
+            # netstat -ano 输出格式: "  TCP    127.0.0.1:9222    0.0.0.0:0    LISTENING    12345"
             result = subprocess.run(
-                f'netstat -ano | findstr :{port}',
+                f'netstat -ano | findstr ":9222 "',
+                shell=True, capture_output=True, text=True, timeout=10
+            )
+            # 降低误匹配：直接查指定端口
+            result = subprocess.run(
+                f'netstat -ano | findstr /C:":{port} "',
                 shell=True, capture_output=True, text=True, timeout=10
             )
             pids = set()
             for line in result.stdout.splitlines():
-                if f":{port}" in line and ("LISTENING" in line or "TIME_WAIT" in line):
-                    parts = line.strip().split()
-                    if len(parts) >= 5:
-                        pid = parts[-1]
-                        if pid.isdigit():
-                            pids.add(pid)
+                line_stripped = line.strip()
+                if "LISTENING" not in line_stripped:
+                    continue
+                parts = line_stripped.split()
+                if len(parts) < 5:
+                    continue
+                # 精确解析本地地址中的端口号，防止 :9222 误匹配 :92220
+                local_addr = parts[1]  # 如 "127.0.0.1:9222"
+                if ":" in local_addr:
+                    actual_port = local_addr.rsplit(":", 1)[-1]
+                    if actual_port != str(port):
+                        continue  # 端口号不精确匹配，跳过
+                pid_str = parts[-1]
+                if not pid_str.isdigit():
+                    continue
+                pid = int(pid_str)
+                if pid <= 0:
+                    continue
+                pids.add(str(pid))
 
-            #杀掉每个PID进程树
             for pid in pids:
-                subprocess.run(
-                    f'taskkill /T /F /PID {pid}',
+                # 验证进程名确实是 Chrome，防止误杀其他应用
+                try:
+                    tasklist_result = subprocess.run(
+                        f'tasklist /FI "PID eq {pid}" /FO CSV /NH',
+                        shell=True, capture_output=True, text=True, timeout=5
+                    )
+                    if "chrome.exe" not in tasklist_result.stdout.lower():
+                        log_print(f"[!] 端口 {port} 上的进程 PID:{pid} 不是 Chrome，跳过")
+                        continue
+                except Exception:
+                    pass  # 无法验证，继续尝试关闭
+
+                # 先尝试优雅关闭（无 /F），失败再用 /F
+                grace_result = subprocess.run(
+                    f'taskkill /PID {pid}',
                     shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10
                 )
-                log_print(f"[*] 已强制结束 Chrome 进程树 PID:{pid} (端口 {port})")
-            safe_sleep(1.2)
-            #兜底二次查杀
-            if is_port_open(port):
-                subprocess.run(
-                    'wmic process where "name=\'chrome.exe\'" get ProcessId,CommandLine',
-                    shell=True,capture_output=True,text=True, timeout=10
-                )
+                if grace_result.returncode != 0:
+                    subprocess.run(
+                        f'taskkill /F /PID {pid}',
+                        shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10
+                    )
+                log_print(f"[*] 已结束 Chrome 进程 PID:{pid} (端口 {port})")
+            if pids:
+                safe_sleep(1.2)
+
         else:
+            # mac/linux
             result = subprocess.run(
                 f"lsof -ti tcp:{port}",
                 shell=True, capture_output=True, text=True, timeout=10
@@ -618,7 +675,7 @@ def _kill_chrome_by_port(port: int):
                         f"kill -9 {pid}",
                         shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10
                     )
-                    log_print(f"[*] 已强制结束 Chrome 进程 PID:{pid} (端口 {port})")
+                    log_print(f"[*] 已强制结束进程 PID:{pid} (端口 {port})")
     except Exception as e:
         log_print(f"[!] 强制结束 Chrome 进程失败: {e}")
 
@@ -683,7 +740,7 @@ def cleanup_instance(instance_config: dict, kill_browser: bool = True, release_p
     # 4. 切换账号时彻底删除 Profile（避免缓存串号）
     if kill_browser and profile_dir and os.path.exists(profile_dir):
         try:
-            shutil.rmtree(profile_dir)
+            _safe_rmtree_profile(profile_dir)
             log_print(f"[*] 已清理 Profile 目录: {profile_dir}")
         except PermissionError as e:
             log_print(f"[!] Profile目录被进程占用，跳过本次删除(WinError5): {e}")
@@ -1403,7 +1460,7 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
                 _kill_chrome_by_port(port)
                 safe_sleep(1.5)
                 try:
-                    shutil.rmtree(profile_dir)
+                    _safe_rmtree_profile(profile_dir)
                 except Exception:
                     pass
                 os.makedirs(profile_dir, exist_ok=True)
