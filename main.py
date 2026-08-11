@@ -900,6 +900,15 @@ def is_logged_in(page) -> tuple[bool, str]:
     if is_still_on_login_page(page):
         return False, "仍存在登录框"
 
+    # 首要判断：首页"交易"导航按钮是否出现（最可靠的登录成功标志）
+    try:
+        trade_btn = page.locator('[role="button"]').filter(has_text="交易")
+        if trade_btn.count() > 0:
+            return True, "首页'交易'按钮已出现，登录成功"
+    except Exception:
+        pass
+
+    # 兜底：已有的标题和元素判断
     try:
         title = page.title()
         if "工作台" in title or "千牛" in title or "卖家中心" in title:
