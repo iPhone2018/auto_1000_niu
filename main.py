@@ -1540,12 +1540,12 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
 
             log_print("[*] 输入账号...")
             login_frame.fill("#fm-login-id", USERNAME)
-            safe_sleep(1.5)
+            safe_sleep(5)
             check_stop()
 
             log_print("[*] 输入密码...")
             login_frame.fill("#fm-login-password", PASSWORD)
-            safe_sleep(1)
+            safe_sleep(5)
             check_stop()
 
             log_print("[*] 点击登录按钮...")
