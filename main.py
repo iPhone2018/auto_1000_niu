@@ -908,13 +908,13 @@ def is_logged_in(page) -> tuple[bool, str]:
     except Exception:
         pass
 
-    # 兜底：已有的标题和元素判断
-    try:
-        title = page.title()
-        if "工作台" in title or "千牛" in title or "卖家中心" in title:
-            return True, f"登录框消失且标题为: {title}"
-    except Exception:
-        pass
+    # # 兜底：已有的标题和元素判断
+    # try:
+    #     title = page.title()
+    #     if "工作台" in title or "千牛" in title or "卖家中心" in title:
+    #         return True, f"登录框消失且标题为: {title}"
+    # except Exception:
+    #     pass
 
     try:
         selectors = [
