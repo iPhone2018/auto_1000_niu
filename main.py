@@ -992,7 +992,8 @@ def parse_refund_address(addr_str: str, session: requests.Session) -> dict:
     return {
         "contactName": resp_data.get("name", ""),
         "mobilePhone": resp_data.get("mobilePhone", ""),
-        "adr": resp_data.get("province", "")+resp_data.get("city", "")+resp_data.get("county", "")+resp_data.get("town", "")+resp_data.get("detailAddress", ""),
+        # "adr": resp_data.get("province", "")+resp_data.get("city", "")+resp_data.get("county", "")+resp_data.get("town", "")+resp_data.get("detailAddress", ""),
+        "adr": resp_data.get("province", "") + addr_str.split(resp_data.get("province", ""))[-1],
         "provinceName": resp_data.get("province", ""),
         "cityName": resp_data.get("city", ""),
         "districtName": resp_data.get("county", ""),
@@ -1416,6 +1417,15 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
             cgDanhao = p_order.get("cgDanhao")
             if not cgDanhao:
                 continue
+            refund_info_address = p_order.get("refundInfoAddress")
+            if refund_info_address and (refund_info_address is not None):
+                new_orders.append({
+                    "tid": tid,
+                    "cgDanhao": cgDanhao,
+                    "targetShopId": "",
+                    "refund_address": refund_info_address,
+                })
+                continue
             targetShopId = p_order.get("targetShopId")
             if not targetShopId:
                 continue
@@ -1436,9 +1446,11 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
                     "plat": 4,
                 })
 
-    if not targetShopIdList:
-        log_print("没有需要查询地址的供应商！")
+    if not new_orders:
+        log_print("没有符合条件的订单！")
         return
+    if not targetShopIdList:
+        log_print("[*] 所有订单均自带退款地址，无需查询供应商地址，直接进入处理流程")
 
     BATCH_MAX = 20
     shop_address_map = {}
@@ -1458,10 +1470,14 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
     final_result = []
     for item in new_orders:
         check_stop()
+        if item.get("refund_address") and (item.get("refund_address") is not None):
+            final_result.append(item)
+            continue
         sid = str(item["targetShopId"])
         addr = shop_address_map.get(sid, "")
         if not addr or not addr.strip():
-            log_print(f"    ⚠️ 供应商 shopId={sid} 无退货地址，跳过关联订单 tid={item['tid']}")
+            log_print(f"    ⚠️ 供应商 shopId={sid} 无退货地址，订单 tid={item['tid']} 记录失败并跳过")
+            append_order_record(FAIL_FILE, item["tid"], qn_username, reason='供应商无退货地址')
             continue
         item["refund_address"] = addr
         final_result.append(item)
@@ -1536,13 +1552,8 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
             else:
                 log_print(f"[*] 未登录，开始自动填充账号密码... ({reason})")
 
-            login_frame, source = find_login_frame(page)
-            if not login_frame:
-                log_print("[!] 未找到登录框，终止登录流程")
-                return
-
-            log_print(f"[+] 找到登录框: {source}")
-
+            # 先切换密码登录 tab：该点击会重载登录 iframe，
+            # 必须先于查找登录框执行，否则拿到的是即将失效的旧句柄
             try:
                 tab = page.locator(".password-login-tab-item")
                 if tab.count() > 0 and tab.is_visible():
@@ -1552,19 +1563,64 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
             except Exception:
                 pass
 
+            def login_frame_op(op_desc, op, retries=3):
+                """登录框安全操作：每次操作前重新查找 frame，句柄失效自动重查重试。
+
+                淘宝登录 iframe 会在账号状态检查、风控预加载、表单提交等时机被
+                浏览器替换或重载，此前查找得到的 Frame 句柄随即失效
+                （playwright 报 Frame was detached）。本函数在每次操作前重新查找，
+                仅在句柄失效类错误时重试，避免持有过期句柄。
+                """
+                last_err = None
+                for attempt in range(1, retries + 1):
+                    check_stop()
+                    try:
+                        frame, source = find_login_frame(page)
+                    except Exception as e:
+                        last_err = e
+                        log_print(f"    [!] {op_desc}：查找登录框异常（第 {attempt}/{retries} 次）: {e}")
+                        safe_sleep(1)
+                        continue
+                    if not frame:
+                        last_err = RuntimeError("未找到登录框")
+                        log_print(f"    [!] {op_desc}：未找到登录框（第 {attempt}/{retries} 次）")
+                        safe_sleep(1)
+                        continue
+                    if attempt == 1:
+                        log_print(f"[+] 找到登录框: {source}")
+                    try:
+                        op(frame)
+                        return
+                    except Exception as e:
+                        last_err = e
+                        log_print(f"    [!] {op_desc} 失败（第 {attempt}/{retries} 次）: {e}")
+                        # 只有句柄失效类错误重试才有意义，其他错误直接抛出
+                        if "detached" not in str(e).lower() and "closed" not in str(e).lower():
+                            raise
+                        safe_sleep(1)
+                raise last_err if last_err else RuntimeError(f"{op_desc} 失败")
+
             log_print("[*] 输入账号...")
-            login_frame.fill("#fm-login-id", USERNAME)
-            safe_sleep(5)
+            login_frame_op("填写账号", lambda f: f.fill("#fm-login-id", USERNAME))
+            safe_sleep(1)
             check_stop()
 
             log_print("[*] 输入密码...")
-            login_frame.fill("#fm-login-password", PASSWORD)
-            safe_sleep(5)
+            login_frame_op("填写密码", lambda f: f.fill("#fm-login-password", PASSWORD))
+            safe_sleep(1)
             check_stop()
 
             log_print("[*] 点击登录按钮...")
-            login_frame.click(".fm-submit.password-login")
-            safe_sleep(3)
+            try:
+                login_frame_op("点击登录", lambda f: f.click(".fm-submit.password-login"))
+            except TaskStoppedException:
+                raise
+            except Exception as e:
+                # 点击瞬间 iframe 常因表单提交/页面跳转被替换（Frame was detached），
+                # 此时提交可能已生效；不中止任务，交由下方监测循环判断真实登录状态
+                log_print(f"    [!] 点击登录按钮异常: {e}")
+                log_print("    [*] 若登录框仍存在，请手动点击登录按钮，程序将持续监测登录结果")
+            safe_sleep(1)
             check_stop()
 
             log_print("\n" + "=" * 65)
@@ -1681,6 +1737,11 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
                 fail_count += 1
                 append_order_record(FAIL_FILE, tid, qn_username, reason='订单有多个子订单')
                 log_print(f"    [*] 订单 {tid} 有 {len(sub_orders)} 个子订单，跳过")
+                continue
+            if len(sub_orders) == 0:
+                fail_count += 1
+                append_order_record(FAIL_FILE, tid, qn_username, reason='订单无子订单数据')
+                log_print(f"    [*] 订单 {tid} 无子订单数据，跳过")
                 continue
 
             sub_order = sub_orders[0]
@@ -1804,9 +1865,23 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
                 safe_sleep(0.8)
                 continue
 
-                # 接口返回成功，增加真实订单回查校验！
+            # 接口返回成功，增加真实订单回查校验！
             log_print(f"    [*] mtop接口返回成功，开始回查订单校验真实地址是否生效...")
-            verify_pass, verify_msg = verify_order_return_address(session, tid, new_address_id)
+            try:
+                verify_pass, verify_msg = verify_order_return_address(session, tid, new_address_id)
+            except TaskStoppedException:
+                # 停止信号：mtop 已提交成功，若不留记录，下次运行会重复修改该订单
+                log_print(f"    [!] 校验被中断（停止信号），订单 {tid} 地址已提交修改，补记记录")
+                append_order_record(FAIL_FILE, tid, qn_username, reason='mtop已提交但校验被中断')
+                raise
+            except Exception as e:
+                # 校验异常不等于修改失败：mtop 已成功，补记记录后跳过，避免下次重复修改
+                log_print(f"    [!] 回查校验异常: {e}")
+                fail_count += 1
+                append_order_record(FAIL_FILE, tid, qn_username,
+                                    reason=f"订单地址修改后校验异常")
+                safe_sleep(0.5)
+                continue
             log_print(f"    [*] 校验结果: {verify_msg}")
             if verify_pass:
                 log_print(f"    [+] ✅ 订单 {tid} 校验确认修改真正生效")
@@ -1819,9 +1894,10 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
             safe_sleep(1.2)
 
         if not matched:
-            log_print(f"    [!] 订单 {tid} 在批量查询结果中未找到，跳过")
+            # 批量查询未返回该订单：多为临时性失败，不写失败记录，
+            # 下次运行会自动重试（该订单不在过滤名单中）
+            log_print(f"    [!] 订单 {tid} 在批量查询结果中未找到，本次跳过，下次运行将自动重试")
             fail_count += 1
-            append_order_record(FAIL_FILE, tid, qn_username, reason='批量查询未返回该订单')
 
     log_print(f"\n{'=' * 70}")
     log_print(
