@@ -221,18 +221,35 @@ def save_one_account(acc_type: str, username: str, password: str):
 
 
 def save_qz_shop_name(qz_username: str, shop_name: str):
-    if not qz_username.strip():
+    """把店铺名加入该雀手账号的店铺列表（去重，最近使用的排最前）"""
+    if not qz_username.strip() or not shop_name.strip():
         return
     store = load_account_store()
     if "qz_shops" not in store:
         store["qz_shops"] = {}
-    store["qz_shops"][qz_username.strip()] = shop_name.strip()
+    shops = store["qz_shops"].get(qz_username.strip(), [])
+    if isinstance(shops, str):  # 兼容旧版本单店铺字符串格式
+        shops = [shops] if shops else []
+    if shop_name.strip() in shops:
+        shops.remove(shop_name.strip())
+    shops.insert(0, shop_name.strip())
+    store["qz_shops"][qz_username.strip()] = shops
     save_account_store(store)
 
 
-def get_qz_shop_name(qz_username: str) -> str:
+def get_qz_shop_names(qz_username: str) -> list:
+    """获取该雀手账号的全部店铺名列表（最近使用的排最前）"""
     store = load_account_store()
-    return store.get("qz_shops", {}).get(qz_username.strip(), "")
+    shops = store.get("qz_shops", {}).get(qz_username.strip(), [])
+    if isinstance(shops, str):  # 兼容旧版本单店铺字符串格式
+        return [shops] if shops else []
+    return list(shops)
+
+
+def get_qz_shop_name(qz_username: str) -> str:
+    """获取该雀手账号最近一次使用的店铺名"""
+    names = get_qz_shop_names(qz_username)
+    return names[0] if names else ""
 
 
 # ==================== 执行记录文件管理 ====================
@@ -1996,22 +2013,38 @@ class App:
         self.instance_config = None
         self.prev_instance_config = None  # 用于跟踪上一个实例，切换账号时清理
         self.consume_log_queue()
+        # 启动时刷新账号/店铺下拉，并自动带出默认账号的最新密码与最近使用店铺
+        self.refresh_account_combobox()
+        self._fill_qz_password()
+        self._fill_qn_password()
         self.qz_shop_var.set(get_qz_shop_name(self.qz_user_var.get().strip()))
 
-    def on_qz_account_select(self, event):
+    def _fill_qz_password(self):
+        """按当前选中的雀手账号自动带出已保存的最新密码"""
         acc = self.qz_user_var.get().strip()
         pwd = self.acc_store["qz"].get(acc, "")
-        self.qz_pass.delete(0, tk.END)
-        self.qz_pass.insert(0, pwd)
-        # 新增：自动填充该账号上次用过的店铺名称
-        shop = get_qz_shop_name(acc)
-        self.qz_shop_var.set(shop)
+        if pwd:
+            self.qz_pass.delete(0, tk.END)
+            self.qz_pass.insert(0, pwd)
 
-    def on_qn_account_select(self, event):
+    def _fill_qn_password(self):
+        """按当前选中的千牛账号自动带出已保存的最新密码"""
         acc = self.qn_user_var.get().strip()
         pwd = self.acc_store["qn"].get(acc, "")
-        self.qn_pass.delete(0, tk.END)
-        self.qn_pass.insert(0, pwd)
+        if pwd:
+            self.qn_pass.delete(0, tk.END)
+            self.qn_pass.insert(0, pwd)
+
+    def on_qz_account_select(self, event):
+        self._fill_qz_password()
+        # 自动带出该账号最近使用的店铺，并刷新店铺下拉为该账号的全部店铺
+        acc = self.qz_user_var.get().strip()
+        shops = get_qz_shop_names(acc)
+        self.qz_shop['values'] = shops
+        self.qz_shop_var.set(shops[0] if shops else "")
+
+    def on_qn_account_select(self, event):
+        self._fill_qn_password()
 
     def select_chrome_file(self):
         global g_user_chrome_path
@@ -2045,7 +2078,8 @@ class App:
         self.acc_store = load_account_store()
         self.qz_user['values'] = list(self.acc_store["qz"].keys())
         self.qn_user['values'] = list(self.acc_store["qn"].keys())
-        self.qz_shop['values'] = list(self.acc_store.get("qz_shops", {}).values())
+        # 店铺下拉只显示当前选中雀手账号下的店铺（最近使用的排最前）
+        self.qz_shop['values'] = get_qz_shop_names(self.qz_user_var.get().strip())
 
     def start_task(self):
         global g_user_chrome_path, INSTANCE_NAME
