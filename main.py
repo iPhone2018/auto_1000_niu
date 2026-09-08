@@ -1038,10 +1038,9 @@ def is_valid_parsed_address(new_info: dict) -> bool:
 
 # ==================== 淘宝订单与地址接口 ====================
 
-def query_order_by_tid(session: requests.Session, tids: str):
+def query_order_by_tid(session: requests.Session, tids: str, max_retry: int = 3):
     url = "https://trade.taobao.com/trade/itemlist/asyncSold.htm"
     params = {"event_submit_do_query": "1", "_input_charset": "utf8"}
-
     data = {
         "isQnNew": "true",
         "isHideNick": "true",
@@ -1054,7 +1053,7 @@ def query_order_by_tid(session: requests.Session, tids: str):
         "useCheckcode": "false",
         "errorCheckcode": "false",
         "payDateBegin": "0",
-        "rateStatus": "ALL",
+        "rateStatus": "",
         "buyerNick": "",
         "orderStatus": "",
         "pageSize": "15",
@@ -1092,32 +1091,51 @@ def query_order_by_tid(session: requests.Session, tids: str):
         "isBatchSearch": "true"
     }
 
-    try:
-        resp = session.post(
-            url,
-            params=params,
-            data=urllib.parse.urlencode(data),
-            headers=TB_API_HEADERS,
-            timeout=30,
-        )
-        safe_sleep(2)
-        check_stop()
-    except Exception as e:
-        log_print(f"    [!] 请求订单接口异常: {e}")
-        return None
+    retry_count = 0
+    while retry_count < max_retry:
+        try:
+            resp = session.post(
+                url,
+                params=params,
+                data=urllib.parse.urlencode(data),
+                headers=TB_API_HEADERS,
+                timeout=30,
+            )
+            safe_sleep(2)
+            check_stop()
+        except Exception as e:
+            retry_count += 1
+            log_print(f"    [!] 请求订单接口异常: {e}, 重试 {retry_count}/{max_retry}, sleep 10s")
+            if retry_count >= max_retry:
+                return None
+            safe_sleep(10)
+            continue
 
-    if resp.status_code != 200:
-        log_print(f"    [!] 订单接口状态码异常: {resp.status_code}")
-        return None
+        if resp.status_code != 200:
+            retry_count += 1
+            log_print(f"    [!] 订单接口状态码异常: {resp.status_code}, 重试 {retry_count}/{max_retry}, sleep 10s")
+            if retry_count >= max_retry:
+                return None
+            safe_sleep(15)
+            continue
 
-    try:
-        result = resp.json()
-    except Exception as e:
-        log_print(f"    [!] 订单接口 JSON 解析失败: {e}")
-        return None
+        try:
+            print(f"订单接口查询结果：{resp.text[:500]}")
+            result = resp.json()
+        except Exception as e:
+            retry_count += 1
+            log_print(f"    [!] 订单接口 JSON 解析失败: {e}, 重试 {retry_count}/{max_retry}, sleep 10s")
+            if retry_count >= max_retry:
+                return None
+            safe_sleep(10)
+            continue
 
-    log_print(f"    [+] 订单接口传入条数： {len(str(tids).split(','))} 返回数据条数: {len(result.get('mainOrders', []))}")
-    return result
+        # 走到这里代表成功，返回结果
+        log_print(f"    [+] 订单接口传入条数： {len(str(tids).split(','))} 返回数据条数: {len(result.get('mainOrders', []))}")
+        return result
+
+    # 理论不会走到这里，兜底
+    return None
 
 
 def get_address_list(session: requests.Session) -> list:
@@ -1737,6 +1755,8 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
     for idx, order in enumerate(ORDERS):
         check_stop()
         tid = order["tid"]
+        if str(tid) != '3317006352113028589':
+            continue
         if str(tid) in filtered_tids:
             continue
         refund_address = order["refund_address"]
