@@ -1755,8 +1755,6 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
     for idx, order in enumerate(ORDERS):
         check_stop()
         tid = order["tid"]
-        if str(tid) != '3317006352113028589':
-            continue
         if str(tid) in filtered_tids:
             continue
         refund_address = order["refund_address"]
