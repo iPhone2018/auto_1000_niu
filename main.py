@@ -115,6 +115,11 @@ INSTANCE_NAME = ""
 # ==================== 全局停止控制 ====================
 _task_stop_event = threading.Event()
 
+# ==================== 淘宝风控等待全局状态 ====================
+_ACTIVE_PORT = 0            # 当前实例的 Chrome 调试端口（用于同步验证后的 Cookie）
+_ACTIVE_COOKIE_JAR = None   # 登录后导出的 Cookie 快照（风控验证后同步刷新）
+_OPENED_VERIFY_URLS = set()  # 已自动打开过的验证页面，避免重复弹标签页
+
 
 class TaskStoppedException(Exception):
     pass
@@ -137,7 +142,10 @@ LOG_QUEUE = Queue(maxsize=2000)
 
 def log_print(text):
     prefix = f"[{INSTANCE_NAME}] " if INSTANCE_NAME else ""
-    LOG_QUEUE.put(prefix + text)
+    msg = prefix + text
+    LOG_QUEUE.put(msg)
+    # 同时输出到 stdout，便于外部终端/监控进程实时查看日志
+    print(msg, flush=True)
 
 
 # ==================== 账号存储工具函数（新增并发保护）====================
@@ -300,10 +308,13 @@ def cleanup_old_records(filepath: str):
 
 def append_order_record(filepath, tid, qn_username, reason=""):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    if reason:
-        line = f"{tid},{ts},{qn_username},{reason}\n"
+    # 记录文件用逗号分隔，原因里的逗号/换行必须替换，否则会破坏解析
+    safe_reason = str(reason).replace(",", "，").replace("\n", " ").strip()
+    safe_qn = str(qn_username).replace(",", "，").replace("\n", " ").strip()
+    if safe_reason:
+        line = f"{tid},{ts},{safe_qn},{safe_reason}\n"
     else:
-        line = f"{tid},{ts},{qn_username},\n"
+        line = f"{tid},{ts},{safe_qn},\n"
     with open(filepath, "a", encoding="utf-8") as f:
         f.write(line)
 
@@ -314,12 +325,36 @@ def get_filtered_tids() -> set:
 
 # ==================== 雀手平台接口 ====================
 
+def qz_request_with_retry(method: str, url: str, max_retry: int = 3,
+                          retry_delay: float = 5, **kwargs):
+    """雀手接口请求：网络异常/超时自动重试，避免单次网络抖动终止整个任务。
+
+    失败返回 None，由调用方决定如何处理。
+    """
+    last_err = None
+    for attempt in range(1, max_retry + 1):
+        check_stop()
+        try:
+            return session.request(method, url, **kwargs)
+        except TaskStoppedException:
+            raise
+        except requests.exceptions.RequestException as e:
+            last_err = e
+            log_print(f"    [!] 雀手接口请求异常（{attempt}/{max_retry}）: {e}")
+            if attempt < max_retry:
+                delay = retry_delay * attempt
+                log_print(f"    [*] {delay:.0f} 秒后重试...")
+                safe_sleep(delay)
+    log_print(f"    [!] 雀手接口重试 {max_retry} 次仍失败: {last_err}")
+    return None
+
+
 def login(username: str, password: str):
     login_page_url = (
         f"http://{QZ_HOST}/LoginUI/index"
         f"?redirectURL=%2FAutoOrder%2FAllTradeNew"
     )
-    session.get(login_page_url, headers=BASE_HEADERS, timeout=15)
+    qz_request_with_retry("GET", login_page_url, headers=BASE_HEADERS, timeout=15)
     safe_sleep(0.5)
     check_stop()
 
@@ -330,7 +365,11 @@ def login(username: str, password: str):
         "remember": False,
     }
 
-    resp = session.post(login_url, headers=BASE_HEADERS, data=login_data, timeout=15)
+    resp = qz_request_with_retry("POST", login_url, headers=BASE_HEADERS,
+                                 data=login_data, timeout=15)
+    if resp is None:
+        log_print("❌ 登录请求失败（网络异常）")
+        return False
     login_result = resp.json()
     log_print("登录返回：" + str(login_result))
     safe_sleep(0.5)
@@ -351,7 +390,10 @@ def login(username: str, password: str):
 def get_shop_list(shop_name):
     shop_url = f"http://{QZ_HOST}/AutoOrder/getRelationUser"
     headers = {**BASE_HEADERS, "X-Requested-With": "XMLHttpRequest"}
-    resp = session.get(shop_url, headers=headers, timeout=15)
+    resp = qz_request_with_retry("GET", shop_url, headers=headers, timeout=15)
+    if resp is None:
+        log_print("❌ 获取店铺列表失败（网络异常）")
+        return None
     res_json = resp.json()
     safe_sleep(0.5)
     check_stop()
@@ -423,7 +465,10 @@ def get_trade_list(
     ])
 
     cookies_before = session.cookies.get_dict().copy()
-    resp = session.post(url, headers=QZ_JSON_HEADERS, data=form_data, timeout=15)
+    resp = qz_request_with_retry("POST", url, headers=QZ_JSON_HEADERS,
+                                 data=form_data, timeout=15)
+    if resp is None:
+        return None
     safe_sleep(0.5)
     check_stop()
 
@@ -468,7 +513,11 @@ def get_shop_addr(session: requests.Session, target_shop_list: list):
     log_print("==== 发送的Payload ====")
     log_print(form_data["data"])
 
-    resp = session.post(url, headers=headers, data=form_data, timeout=12)
+    resp = qz_request_with_retry("POST", url, headers=headers,
+                                 data=form_data, timeout=12)
+    if resp is None:
+        log_print("❌ 查询供应商退货地址失败（网络异常）")
+        return {}
     safe_sleep(0.5)
     check_stop()
     log_print("查询供应商退货地址返回：" + resp.text[:500])
@@ -769,7 +818,14 @@ def cleanup_instance(instance_config: dict, kill_browser: bool = True, release_p
 
 def get_instance_config(qn_username: str) -> dict:
     safe_name = re.sub(r'[^\w\u4e00-\u9fff]', '_', qn_username)[:30]
-    port = find_free_port(DEBUG_PORT_RANGE[0], DEBUG_PORT_RANGE[1])
+    # \u8c03\u8bd5/\u6d4b\u8bd5\u7528\uff1a\u8bbe\u7f6e NIU_FIXED_PORT \u53ef\u56fa\u5b9a\u590d\u7528\u5df2\u5728\u8fd0\u884c\u7684 Chrome \u7aef\u53e3\uff0c
+    # \u4e0d\u91cd\u65b0\u5206\u914d\u7aef\u53e3\uff0c\u4ece\u800c\u4fdd\u7559\u8be5\u6d4f\u89c8\u5668\u4f1a\u8bdd\uff08\u4f8b\u5982\u9a8c\u8bc1\u98ce\u63a7\u7b49\u5f85\u6d41\u7a0b\uff09
+    fixed_port = os.environ.get("NIU_FIXED_PORT", "").strip()
+    if fixed_port.isdigit():
+        port = int(fixed_port)
+        log_print(f"[*] \u4f7f\u7528\u56fa\u5b9a\u8c03\u8bd5\u7aef\u53e3: {port}")
+    else:
+        port = find_free_port(DEBUG_PORT_RANGE[0], DEBUG_PORT_RANGE[1])
     profile_dir = os.path.expanduser(f"~/playwright_chrome_profile_{safe_name}_{port}")
     cookie_file = f"taobao_cookies_{safe_name}_{port}.json"
     os.makedirs(profile_dir, exist_ok=True)
@@ -979,6 +1035,55 @@ def load_cookies(filepath: str) -> RequestsCookieJar:
     return jar
 
 
+# 买家备注/说明性文字关键词：出现即从“详细地址”中截断或删除
+_ADDR_NOTE_KEYWORDS = (
+    "拒收", "拒.收", "拒. 收", "直接拒", "退回", "退货", "赠品",
+    "鞋盒", "鞋底", "鞋跟", "磨损", "吊牌", "穿过", "洗过",
+    "香水", "少件", "缺件", "影响二次销售", "不要", "请勿",
+    "备注", "纸条", "订单编号", "订单号", "原因", "保证", "必须",
+    "到付", "包裹", "花盆", "门口", "联系", "密码", "派送",
+    "网点异常", "无理由", "原包装", "包装破损", "包装完好",
+    "配件齐全", "配件完整", "全新未",
+)
+
+
+def clean_address_detail(detail: str) -> str:
+    """清洗“详细地址”：去掉买家备注、括号说明、空白和非法标点。
+
+    淘宝保存地址时会对详细地址做规范校验（高德地址库），地址里混入
+    “拒收/赠品/鞋盒/不要放驿站”等买家备注会被判定为不规范而保存失败。
+    """
+    if not detail:
+        return ""
+    s = str(detail)
+
+    def _bracket(m):
+        inner = m.group(1)
+        # 括号内是买家备注 → 整段删除；否则去括号保留内容（如“富迪文化”）
+        if any(k in inner for k in _ADDR_NOTE_KEYWORDS):
+            return ""
+        if re.search(r"[,，。;；!！?？]", inner):
+            return ""
+        return inner
+
+    # 1) 处理中英文括号/【】/[]
+    s = re.sub(r"[（(【\[]([^）)】\]]*)[）)】\]]", _bracket, s)
+    # 2) 去空白（地址中的空格容易触发高德校验失败）
+    s = re.sub(r"\s+", "", s)
+    # 3) 从最早的备注关键词处截断
+    cut = len(s)
+    for kw in _ADDR_NOTE_KEYWORDS:
+        idx = s.find(kw)
+        if 0 <= idx < cut:
+            cut = idx
+    s = s[:cut]
+    # 4) 逗号/句号/分号等标点后通常是备注，直接截断
+    s = re.split(r"[,，。;；!！?？]", s)[0]
+    # 5) 去掉首尾无用符号
+    s = s.strip(" -_/\\|、.·")
+    return s
+
+
 def parse_refund_address(addr_str: str, session: requests.Session) -> dict:
     # 空文本或占位文本直接返回空 dict，避免无效数据覆盖地址簿
     if not addr_str or not addr_str.strip() or addr_str.strip() == "暂无退货地址":
@@ -997,20 +1102,47 @@ def parse_refund_address(addr_str: str, session: requests.Session) -> dict:
     try:
         addr_str = addr_str.replace("pdd", "").replace("拼多", "").replace("拼多多", "")
         full_url = f"{url}?fullAddress={urllib.parse.quote(addr_str)}"
-        resp = session.get(full_url, headers=headers, timeout=15)
+        resp = _send_with_risk_wait(
+            lambda: session.get(full_url, headers=headers, timeout=15),
+            purpose="识别退货地址",
+            expect_json=True,
+            verify_url=DEFAULT_VERIFY_URL,
+            target_session=session,
+        )
         log_print(f"        ✅ 地址识别接口调用成功: {resp.text}")
         resp_data = resp.json().get("data", {})
         safe_sleep(0.5)
         check_stop()
+    except TaskStoppedException:
+        raise
     except Exception as e:
         log_print(f"        ⚠️ 结构化地址接口调用失败: {e}")
         return {}
 
+    # 详细地址优先使用淘宝结构化接口返回的 detailAddress（已去掉省市区），
+    # 再清洗掉买家备注/括号说明/空格，避免保存地址时被地址规范校验拒绝。
+    raw_detail = resp_data.get("detailAddress", "") or ""
+    # 有些地址的 detailAddress 仍带省/市/区/街道前缀，去掉避免与独立字段重复
+    for part in (resp_data.get("province", ""), resp_data.get("city", ""),
+                 resp_data.get("county", ""), resp_data.get("town", "")):
+        part = (part or "").strip()
+        if part:
+            raw_detail = re.sub(rf"^\s*{re.escape(part)}", "", raw_detail)
+    detail = clean_address_detail(raw_detail)
+    if not detail:
+        # 兜底：从原始地址中扣掉省/市/区/街道后，取剩余部分作为详细地址
+        fallback = addr_str
+        for part in (resp_data.get("province", ""), resp_data.get("city", ""),
+                     resp_data.get("county", ""), resp_data.get("town", "")):
+            if part and fallback.startswith(part):
+                fallback = fallback[len(part):]
+        detail = clean_address_detail(fallback)
+
     return {
         "contactName": resp_data.get("name", ""),
         "mobilePhone": resp_data.get("mobilePhone", ""),
-        # "adr": resp_data.get("province", "")+resp_data.get("city", "")+resp_data.get("county", "")+resp_data.get("town", "")+resp_data.get("detailAddress", ""),
-        "adr": resp_data.get("province", "") + addr_str.split(resp_data.get("province", ""))[-1],
+        "adr": detail,
+        "detailAddress": detail,
         "provinceName": resp_data.get("province", ""),
         "cityName": resp_data.get("city", ""),
         "districtName": resp_data.get("county", ""),
@@ -1033,10 +1165,323 @@ def is_valid_parsed_address(new_info: dict) -> bool:
     # 至少要有省或市
     if not new_info.get("provinceName", "").strip() and not new_info.get("cityName", "").strip():
         return False
+    # divisionId 是保存地址的必填项，缺失时无法可靠推导 areaId
+    if not str(new_info.get("divisionId", "")).strip():
+        return False
     return True
 
 
 # ==================== 淘宝订单与地址接口 ====================
+
+DEFAULT_VERIFY_URL = "https://myseller.taobao.com/home.htm/trade-platform/tp/sold"
+
+# 强风控特征：正常业务数据中绝不会出现，任何响应命中都判定为风控
+_RISK_MARKERS_STRONG = (
+    "rgv587",
+    "x5sec",
+    "_____tmd_____",
+    "punish",
+    "fail_sys_user_validate",
+    "fail_sys_illegal_access",
+    "havanalogin",
+    "login.taobao.com",
+)
+# 弱风控特征：只在响应不是正常业务 JSON（如 HTML 验证页）时才扫描，
+# 避免订单标题/收货地址中偶然出现这些词导致误判
+_RISK_MARKERS_WEAK = (
+    "亲，访问受限了",
+    "访问受限",
+    "请完成验证",
+    "滑动验证",
+    "滑块验证",
+    "安全验证",
+    "身份验证",
+    "验证码",
+)
+_RISK_MARKERS_MANUAL = _RISK_MARKERS_STRONG + _RISK_MARKERS_WEAK
+# mtop token 过期：无需人工验证，自动刷新后重试
+_RISK_MARKERS_TOKEN = (
+    "fail_sys_token_exoired",
+    "fail_sys_token_expired",
+    "fail_sys_token_empty",
+    "令牌过期",
+)
+
+
+def _resp_text(resp) -> str:
+    try:
+        return resp.text or ""
+    except Exception:
+        return ""
+
+
+def _extract_verify_url(text: str, parsed=None) -> str:
+    """从接口响应中提取需要用户打开的验证/登录页面 URL"""
+    if isinstance(parsed, dict):
+        data = parsed.get("data")
+        if isinstance(data, dict):
+            for key in ("url", "redirectUrl", "redirectURL"):
+                val = data.get(key)
+                if isinstance(val, str) and val.startswith("http"):
+                    return val.replace("\\/", "/")
+        for key in ("url", "redirectUrl", "redirectURL"):
+            val = parsed.get(key)
+            if isinstance(val, str) and val.startswith("http"):
+                return val.replace("\\/", "/")
+    if not text:
+        return ""
+    normalized = text.replace("\\/", "/").replace("&amp;", "&")
+    for m in re.finditer(r'https?://[^\s"\'<>\\]+', normalized):
+        url = m.group(0)
+        low = url.lower()
+        if ("punish" in low or "_____tmd_____" in low or "x5sec" in low
+                or "login.taobao.com" in low or "havanalogin" in low):
+            return url
+    return ""
+
+
+def detect_risk_control(resp, expect_json: bool = False):
+    """检测淘宝接口响应是否触发风控/需要人工验证。
+
+    返回 None 或：
+      {"kind": "manual"|"token"|"login", "reason": str, "verify_url": str}
+    - manual：需要在浏览器完成滑块/短信等验证
+    - login ：登录态失效，需要在浏览器重新登录
+    - token ：mtop Token 过期，自动刷新重试即可
+    """
+    text = _resp_text(resp)
+    low = text.lower()
+    ctype = (resp.headers.get("Content-Type", "") or "").lower()
+    status = resp.status_code
+    final_url = (getattr(resp, "url", "") or "").lower()
+
+    parsed = None
+    if "json" in ctype or text.lstrip().startswith("{"):
+        try:
+            parsed = resp.json()
+        except Exception:
+            parsed = None
+
+    verify_url = _extract_verify_url(text, parsed)
+
+    # 1) mtop token 失效：无需人工验证
+    for marker in _RISK_MARKERS_TOKEN:
+        if marker in low:
+            return {"kind": "token", "reason": marker, "verify_url": ""}
+
+    # 2) 登录态失效（需要用户重新登录）
+    if "fail_sys_session_expired" in low or "session expired" in low:
+        return {"kind": "login", "reason": "登录态已失效",
+                "verify_url": verify_url or DEFAULT_VERIFY_URL}
+    if status in (401, 403, 419):
+        return {"kind": "login", "reason": f"HTTP {status}",
+                "verify_url": verify_url or DEFAULT_VERIFY_URL}
+    if "login" in final_url and "taobao" in final_url:
+        return {"kind": "login", "reason": "请求被重定向到登录页",
+                "verify_url": verify_url or DEFAULT_VERIFY_URL}
+    if status in (301, 302, 303, 307, 308):
+        loc = (resp.headers.get("Location", "") or "").lower()
+        if "login" in loc or "passport" in loc:
+            return {"kind": "login", "reason": "请求被重定向到登录页",
+                    "verify_url": verify_url or DEFAULT_VERIFY_URL}
+
+    # 3) JSON 明确风控标记（ret 错误码 / 风控字段 / 验证URL）
+    success_json = False
+    if isinstance(parsed, dict):
+        ret = parsed.get("ret")
+        if isinstance(ret, list):
+            joined = " ".join(str(r) for r in ret)
+            joined_low = joined.lower()
+            for marker in _RISK_MARKERS_MANUAL:
+                if marker in joined_low:
+                    return {"kind": "manual", "reason": joined,
+                            "verify_url": verify_url or DEFAULT_VERIFY_URL}
+            for marker in _RISK_MARKERS_TOKEN:
+                if marker in joined_low:
+                    return {"kind": "token", "reason": joined, "verify_url": ""}
+
+        for flag_key in ("rgv587_flag", "x5sec", "punish"):
+            if parsed.get(flag_key):
+                return {"kind": "manual", "reason": f"JSON字段 {flag_key}",
+                        "verify_url": verify_url or DEFAULT_VERIFY_URL}
+
+        data = parsed.get("data")
+        if isinstance(data, dict):
+            data_url = data.get("url")
+            if isinstance(data_url, str) and data_url.startswith("http"):
+                dl = data_url.lower()
+                if any(k in dl for k in ("punish", "_____tmd_____", "x5sec", "login")):
+                    return {"kind": "login" if "login" in dl else "manual",
+                            "reason": "接口返回验证/登录URL",
+                            "verify_url": data_url}
+
+        # 正常业务 JSON（订单列表 / success=true / 有数据）：不做弱特征文本扫描
+        success_json = (("mainOrders" in parsed)
+                        or (parsed.get("success") is True)
+                        or bool(data))
+
+    # 4) 强风控特征：任何响应中出现都判定为风控
+    for marker in _RISK_MARKERS_STRONG:
+        if marker in low:
+            return {"kind": "manual", "reason": marker,
+                    "verify_url": verify_url or DEFAULT_VERIFY_URL}
+
+    # 5) 弱风控特征：仅当不是正常业务 JSON 时扫描
+    if not success_json:
+        for marker in _RISK_MARKERS_WEAK:
+            if marker in low:
+                return {"kind": "manual", "reason": marker,
+                        "verify_url": verify_url or DEFAULT_VERIFY_URL}
+
+    # 6) 预期返回 JSON 却返回 HTML 页面（通常是验证/登录页）；5xx 交给上层重试
+    if expect_json and status < 500 and text.lstrip().startswith("<"):
+        return {"kind": "manual", "reason": "接口返回 HTML 页面（可能为验证/登录页）",
+                "verify_url": verify_url or DEFAULT_VERIFY_URL}
+    return None
+
+
+def _refresh_taobao_cookies_from_browser(target_session=None, port=None) -> bool:
+    """人工验证通过后，从程序自己的 Chrome 重新导出 Cookie 到 requests 会话。"""
+    global _ACTIVE_COOKIE_JAR
+    target_session = target_session or session
+    port = port or _ACTIVE_PORT
+    if not port or not is_port_open(port):
+        return False
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+            contexts = browser.contexts
+            if not contexts:
+                return False
+            cookies = get_unique_cookies(contexts[0].cookies())
+        if not cookies:
+            return False
+        target_session.cookies.clear()
+        for c in cookies:
+            target_session.cookies.set(
+                name=c["name"], value=c["value"],
+                domain=c.get("domain", ""), path=c.get("path", "/"),
+            )
+        if _ACTIVE_COOKIE_JAR is not None:
+            _ACTIVE_COOKIE_JAR.clear()
+            for c in cookies:
+                _ACTIVE_COOKIE_JAR.set(
+                    name=c["name"], value=c["value"],
+                    domain=c.get("domain", ""), path=c.get("path", "/"),
+                )
+        log_print(f"[*] 已从浏览器同步最新 Cookie（{len(cookies)} 条）")
+        return True
+    except Exception as e:
+        log_print(f"[!] 从浏览器同步 Cookie 失败: {e}")
+        return False
+
+
+def _open_verification_page(url: str, port=None) -> bool:
+    """在程序自己的 Chrome 中打开验证页面，方便用户完成滑块/短信验证。"""
+    url = url or DEFAULT_VERIFY_URL
+    if url in _OPENED_VERIFY_URLS:
+        return True
+    port = port or _ACTIVE_PORT
+    if not port or not is_port_open(port):
+        log_print("[!] 未检测到运行中的 Chrome，请手动打开浏览器完成验证")
+        return False
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+            contexts = browser.contexts
+            if not contexts:
+                return False
+            page = contexts[0].new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            try:
+                page.bring_to_front()
+            except Exception:
+                pass
+        _OPENED_VERIFY_URLS.add(url)
+        log_print("[*] 已在浏览器中自动打开验证页面，请在该窗口中完成验证")
+        return True
+    except Exception as e:
+        log_print(f"[!] 自动打开验证页面失败: {e}")
+        log_print(f"    请手动在浏览器中打开: {url}")
+        return False
+
+
+def _send_with_risk_wait(send_fn, purpose: str, expect_json: bool = False,
+                         verify_url: str = "", target_session=None):
+    """发送淘宝接口请求，遇到风控时无限等待人工验证，验证通过后自动继续。
+
+    说明：
+    - 每 10 秒重试一次原请求，并先从浏览器同步最新 Cookie；
+    - 验证期间不会超时、不会跳过订单；
+    - 用户点击“停止执行”仍可通过 check_stop() 中断。
+    """
+    target_session = target_session or session
+    risk_wait_start = None
+    risk_round = 0
+    token_retry = 0
+    last_reason = ""
+    last_refresh = 0.0
+
+    while True:
+        check_stop()
+        # 等待验证期间：每次重试前先从浏览器同步最新 Cookie
+        # （用户完成滑块/短信后，x5sec 等 Cookie 会写入浏览器）
+        if risk_wait_start is not None:
+            now = time.time()
+            if now - last_refresh >= 10:
+                _refresh_taobao_cookies_from_browser(target_session)
+                last_refresh = now
+
+        try:
+            resp = send_fn()
+        except Exception as e:
+            if risk_wait_start is not None:
+                log_print(f"    [等待人工验证] 请求异常（{e}），5 秒后继续重试...")
+                safe_sleep(5)
+                continue
+            raise
+
+        info = detect_risk_control(resp, expect_json=expect_json)
+
+        if info and info.get("kind") == "token" and token_retry < 3:
+            token_retry += 1
+            log_print(f"    [*] mtop Token 失效（{info['reason']}），"
+                      f"自动刷新后重试 {token_retry}/3")
+            safe_sleep(1)
+            continue
+
+        if not info:
+            if risk_wait_start is not None:
+                elapsed = int(time.time() - risk_wait_start)
+                log_print(f"\n[+] ✅ 人工验证已通过（等待 {elapsed} 秒），"
+                          f"{purpose} 继续执行\n")
+            return resp
+
+        # ---- 需要人工验证 ----
+        risk_round += 1
+        vurl = info.get("verify_url") or verify_url or DEFAULT_VERIFY_URL
+
+        if risk_wait_start is None:
+            risk_wait_start = time.time()
+            log_print("\n" + "!" * 74)
+            log_print(f"[!] ⚠️ 检测到淘宝风控，需要人工验证！当前操作：{purpose}")
+            log_print(f"[!] 触发原因：{info['reason']}")
+            log_print(f"[!] 验证页面：{vurl}")
+            log_print("[!] 请在浏览器中完成滑块验证 / 短信验证码等全部校验。")
+            log_print("[!] 若浏览器显示登录页，请先重新登录千牛/淘宝账号。")
+            log_print("[!] 程序将一直等待（不超时、不跳过订单），验证完成后自动继续。")
+            log_print("[!] 如需终止任务，请点击界面上的【停止执行】。")
+            log_print("!" * 74 + "\n")
+            _open_verification_page(vurl)
+        elif info.get("reason") != last_reason:
+            log_print(f"    [等待人工验证] 风控提示变化：{info['reason']}")
+        last_reason = info.get("reason", "")
+
+        elapsed = int(time.time() - risk_wait_start)
+        log_print(f"    [等待人工验证] 已等待 {elapsed} 秒，第 {risk_round} 次重试"
+                  f"（每 10 秒自动重试，请在浏览器完成验证）...")
+        safe_sleep(10)
+
 
 def query_order_by_tid(session: requests.Session, tids: str, max_retry: int = 3):
     url = "https://trade.taobao.com/trade/itemlist/asyncSold.htm"
@@ -1091,18 +1536,30 @@ def query_order_by_tid(session: requests.Session, tids: str, max_retry: int = 3)
         "isBatchSearch": "true"
     }
 
+    def _send_query():
+        return session.post(
+            url,
+            params=params,
+            data=urllib.parse.urlencode(data),
+            headers=TB_API_HEADERS,
+            timeout=30,
+        )
+
     retry_count = 0
     while retry_count < max_retry:
         try:
-            resp = session.post(
-                url,
-                params=params,
-                data=urllib.parse.urlencode(data),
-                headers=TB_API_HEADERS,
-                timeout=30,
+            # 遇到风控会自动提示并无限等待人工验证，验证通过后才返回
+            resp = _send_with_risk_wait(
+                _send_query,
+                purpose="千牛批量查询订单号",
+                expect_json=True,
+                verify_url=DEFAULT_VERIFY_URL,
+                target_session=session,
             )
             safe_sleep(2)
             check_stop()
+        except TaskStoppedException:
+            raise
         except Exception as e:
             retry_count += 1
             log_print(f"    [!] 请求订单接口异常: {e}, 重试 {retry_count}/{max_retry}, sleep 10s")
@@ -1130,12 +1587,81 @@ def query_order_by_tid(session: requests.Session, tids: str, max_retry: int = 3)
             safe_sleep(10)
             continue
 
-        # 走到这里代表成功，返回结果
-        log_print(f"    [+] 订单接口传入条数： {len(str(tids).split(','))} 返回数据条数: {len(result.get('mainOrders', []))}")
+        # 走到这里代表成功，返回结果；逐条核对本次请求的订单号是否都返回
+        main_orders = result.get("mainOrders", [])
+        returned_ids = [str(o.get("id", "")) for o in main_orders]
+        request_ids = [t.strip() for t in str(tids).split(",") if t.strip()]
+        missing_ids = [t for t in request_ids if t not in returned_ids]
+        log_print(f"    [+] 订单接口传入条数：{len(request_ids)} 返回数据条数: {len(main_orders)}")
+        if missing_ids:
+            log_print(f"    [!] 本次未返回的订单号（{len(missing_ids)} 个）：{','.join(missing_ids)}")
         return result
 
     # 理论不会走到这里，兜底
     return None
+
+
+def query_orders_with_fallback(session: requests.Session, tids_list: list,
+                               batch_size: int = 10):
+    """批量查询订单号，并对批量结果中缺失的订单号逐个补查。
+
+    淘宝批量查询对单次订单号数量有限制，且可能只返回部分结果。
+    这里先按 batch_size 分批，再对缺失订单号逐条查询，最大限度避免漏单。
+
+    return: (found_map, still_missing)
+        found_map: {订单号: mainOrder}
+        still_missing: 逐条补查后仍未查询到的订单号列表
+    """
+    unique_tids = []
+    seen = set()
+    for t in tids_list:
+        t = str(t).strip()
+        if t and t not in seen:
+            seen.add(t)
+            unique_tids.append(t)
+
+    found = {}
+    for start in range(0, len(unique_tids), batch_size):
+        check_stop()
+        batch = unique_tids[start:start + batch_size]
+        log_print(f"    [*] 批量查询订单 {start + 1}~{start + len(batch)} / "
+                  f"{len(unique_tids)}：{','.join(batch)}")
+        result = query_order_by_tid(session, ",".join(batch))
+        orders = (result or {}).get("mainOrders", [])
+        for main_order in orders:
+            oid = str(main_order.get("id", ""))
+            if oid:
+                found[oid] = main_order
+        batch_missing = [t for t in batch if t not in found]
+        if batch_missing:
+            log_print(f"    [!] 批量接口未返回 {len(batch_missing)} 个订单号："
+                      f"{','.join(batch_missing)}")
+        safe_sleep(1)
+
+    missing = [t for t in unique_tids if t not in found]
+    if missing:
+        log_print(f"\n    [*] 开始逐个补查缺失订单号，共 {len(missing)} 个...")
+        for idx, tid in enumerate(missing, 1):
+            check_stop()
+            log_print(f"    [补查 {idx}/{len(missing)}] 订单号 {tid}")
+            result = query_order_by_tid(session, tid)
+            orders = (result or {}).get("mainOrders", [])
+            for main_order in orders:
+                oid = str(main_order.get("id", ""))
+                if oid:
+                    found[oid] = main_order
+            if tid not in found:
+                log_print(f"    [!] 单号 {tid} 单独查询仍未返回")
+            safe_sleep(0.6)
+
+    still_missing = [t for t in unique_tids if t not in found]
+    if still_missing:
+        log_print(f"\n[!] ⚠️ 逐条补查后仍有 {len(still_missing)} 个订单号未查询到："
+                  f"{','.join(still_missing)}")
+        log_print("[!] 这些订单本次跳过（不写入失败记录），下次运行会自动重试")
+    else:
+        log_print(f"\n[+] ✅ 订单号查询完成：请求 {len(unique_tids)} 个，全部查到")
+    return found, still_missing
 
 
 def get_address_list(session: requests.Session) -> list:
@@ -1146,9 +1672,17 @@ def get_address_list(session: requests.Session) -> list:
     }
 
     try:
-        resp = session.get(url, headers=headers, timeout=30)
+        resp = _send_with_risk_wait(
+            lambda: session.get(url, headers=headers, timeout=30),
+            purpose="获取退货地址列表",
+            expect_json=True,
+            verify_url=DEFAULT_VERIFY_URL,
+            target_session=session,
+        )
         safe_sleep(0.5)
         check_stop()
+    except TaskStoppedException:
+        raise
     except Exception as e:
         log_print(f"    [!] 请求地址列表异常: {e}")
         return []
@@ -1191,17 +1725,25 @@ def update_address(
         log_print("    [!] 解析结果缺少收件人姓名/电话/地址，拒绝覆盖地址")
         return False
 
-    provinceName = new_info.get("provinceName") or original.get("provinceName", "")
-    cityName = new_info.get("cityName") or original.get("cityName", "")
-    districtName = new_info.get("districtName") or original.get("districtName", "")
-    townName = new_info.get("townName", "")
-    divisionId = new_info.get("divisionId") or original.get("divisionId", "")
+    # 省市区街道必须以本次解析结果为准，禁止回落到旧地址数据
+    # （旧地址与新地址可能不同省，回落会把“湖北省”配成旧地址的“广州市”）
+    provinceName = (new_info.get("provinceName") or "").strip()
+    cityName = (new_info.get("cityName") or "").strip()
+    districtName = (new_info.get("districtName") or "").strip()
+    townName = (new_info.get("townName") or "").strip()
+    divisionId = str(new_info.get("divisionId") or "").strip()
+    if not divisionId:
+        log_print("    [!] 解析结果缺少 divisionId，拒绝覆盖地址")
+        return False
+    # areaId 是区县级行政区划（divisionId 的前 6 位），
+    # 必须跟随新地址变化，不能沿用旧地址的 areaId
+    areaId = divisionId[:6] if len(divisionId) >= 6 else divisionId
     countryName = new_info.get("countryName", "中国")
 
     data = {
         "_csrf": csrf,
         "adr": adr,
-        "areaId": original.get("areaId", ""),
+        "areaId": areaId,
         "branch": original.get("branch", ""),
         "cityName": cityName,
         "contactId": original.get("contactId", ""),
@@ -1241,13 +1783,22 @@ def update_address(
     log_print(f"        新姓名    : {contact_name}")
     log_print(f"        新电话    : {mobile}")
     log_print(f"        省市区    : {provinceName} {cityName} {districtName} {townName}")
+    log_print(f"        areaId    : {areaId}")
     log_print(f"        divisionId: {divisionId}")
     log_print(f"        新地址    : {adr[:60]}{'...' if len(adr) > 60 else ''}")
 
     try:
-        resp = session.post(url, data=data, headers=headers, timeout=30)
+        resp = _send_with_risk_wait(
+            lambda: session.post(url, data=data, headers=headers, timeout=30),
+            purpose="更新退货地址",
+            expect_json=True,
+            verify_url=DEFAULT_VERIFY_URL,
+            target_session=session,
+        )
         safe_sleep(1)
         check_stop()
+    except TaskStoppedException:
+        raise
     except Exception as e:
         log_print(f"    [!] 更新地址请求异常: {e}")
         return False
@@ -1269,9 +1820,17 @@ def update_address(
     # 重试：ignoreCheck=true 跳过地址规范校验
     data["ignoreCheck"] = "true"
     try:
-        resp = session.post(url, data=data, headers=headers, timeout=30)
+        resp = _send_with_risk_wait(
+            lambda: session.post(url, data=data, headers=headers, timeout=30),
+            purpose="更新退货地址(ignoreCheck)",
+            expect_json=True,
+            verify_url=DEFAULT_VERIFY_URL,
+            target_session=session,
+        )
         safe_sleep(1)
         check_stop()
+    except TaskStoppedException:
+        raise
     except Exception as e:
         log_print(f"    [!] 重试请求异常: {e}")
         return False
@@ -1288,13 +1847,6 @@ def update_address(
 
 
 def update_order_address(session, cookie_jar, data_content):
-    token = extract_m_h5_tk_token(cookie_jar)
-    t_ms = str(int(time.time() * 1000))
-    sign = calc_mtop_sign(token, t_ms, APP_KEY, data_content)
-
-    query_params = {**COMMON_PARAMS, "t": t_ms, "sign": sign}
-    post_data = {"data": data_content}
-
     headers = {
         "User-Agent": TB_API_HEADERS["user-agent"],
         "Accept": "application/json",
@@ -1311,14 +1863,41 @@ def update_order_address(session, cookie_jar, data_content):
         "https://h5api.m.taobao.com/h5/"
         "mtop.com.taobao.order.sold.returnaddress/1.0/"
     )
-    resp = session.post(
-        url=API_URL,
-        params=query_params,
-        data=post_data,
-        cookies=cookie_jar,
-        headers=headers,
-        timeout=15,
-    )
+
+    def _send():
+        # 每次请求都重新取 token 和时间戳签名：风控验证后 _m_h5_tk 可能已刷新，
+        # 使用旧签名会报 TOKEN 错误
+        active_jar = session.cookies
+        try:
+            token = extract_m_h5_tk_token(active_jar)
+        except Exception:
+            token = extract_m_h5_tk_token(cookie_jar)
+        t_ms = str(int(time.time() * 1000))
+        sign = calc_mtop_sign(token, t_ms, APP_KEY, data_content)
+        query_params = {**COMMON_PARAMS, "t": t_ms, "sign": sign}
+        return session.post(
+            url=API_URL,
+            params=query_params,
+            data={"data": data_content},
+            headers=headers,
+            timeout=15,
+        )
+
+    try:
+        # 遇到风控会自动提示并无限等待人工验证，验证通过后才返回
+        resp = _send_with_risk_wait(
+            _send,
+            purpose="修改订单退货地址(mtop)",
+            expect_json=True,
+            verify_url=DEFAULT_VERIFY_URL,
+            target_session=session,
+        )
+    except TaskStoppedException:
+        raise
+    except Exception as e:
+        log_print(f"    [!] mtop 请求异常: {e}")
+        return False, f"请求异常:{e}"
+
     safe_sleep(0.5)
     check_stop()
     log_print(f"状态码: {resp.status_code}")
@@ -1327,17 +1906,30 @@ def update_order_address(session, cookie_jar, data_content):
 
     try:
         result = resp.json()
+        data = result.get("data") or {}
+        # mtop 的 ret 为 SUCCESS 不代表业务成功，必须看 data.resultType
+        # （例如“有进行中的售后单，不支持指定退货地址”时 ret 仍是 SUCCESS）
+        if isinstance(data, dict) and data.get("resultType") is False:
+            reason = data.get("resultEnum") or "mtop业务返回失败"
+            log_print(f"    [!] mtop 业务失败：{reason}")
+            return False, reason
         ret = result.get("ret", [])
         for row in ret:
             if row == 'SUCCESS::调用成功':
-                return True
-        return False
+                return True, ""
+        return False, "mtop返回非成功"
     except Exception:
-        return resp.status_code == 200
+        return resp.status_code == 200, "" if resp.status_code == 200 else f"HTTP {resp.status_code}"
 
 
 def extract_m_h5_tk_token(cookie_jar: requests.cookies.RequestsCookieJar):
-    raw_val = cookie_jar.get("_m_h5_tk")
+    raw_val = None
+    for cookie in cookie_jar:
+        if cookie.name == "_m_h5_tk":
+            raw_val = cookie.value
+            # 优先使用 taobao.com 域下的 token
+            if "taobao.com" in (cookie.domain or ""):
+                break
     if not raw_val:
         raise Exception("Cookie缺失 _m_h5_tk，登录失效！")
     return raw_val.split("_")[0]
@@ -1377,16 +1969,55 @@ def verify_order_return_address(session: requests.Session, tid: str, expect_addr
 
 # ==================== 核心流程 ====================
 
+def parse_manual_addresses(text: str) -> dict:
+    """解析界面输入的手动修正地址。
+
+    每行格式：订单号 修正后的地址
+    - 订单号统一转成字符串，避免 int/str 类型不一致导致匹配失败
+    - 只按第一个空白分割，地址内部若含空格会原样保留
+    """
+    result = {}
+    for lineno, raw_line in enumerate((text or "").splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        tid = str(parts[0]).strip()
+        # 兼容从 Excel 复制出来的 "1234567890123456789.0"
+        if re.fullmatch(r"\d+\.0", tid):
+            tid = tid[:-2]
+        if len(parts) < 2 or not parts[1].strip():
+            log_print(f"[!] 手动修正地址第 {lineno} 行格式错误（应为：订单号 地址）：{line}")
+            continue
+        addr = parts[1].strip()
+        if tid in result:
+            log_print(f"[!] 手动修正地址第 {lineno} 行订单号重复，后者覆盖前者：{tid}")
+        result[tid] = addr
+    return result
+
+
 def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_password: str,
                      filtered_tids: set, start_date: str, end_date: str, instance_config: dict,
-                     qz_shop_name: str = ""):
-    global session, USERNAME, PASSWORD
+                     qz_shop_name: str = "", manual_addresses: dict = None):
+    global session, USERNAME, PASSWORD, _ACTIVE_PORT, _ACTIVE_COOKIE_JAR
     USERNAME = qn_username
     PASSWORD = qn_password
+
+    # 订单号统一按字符串处理，避免界面输入与接口返回 int/str 不一致
+    manual_addresses = {
+        str(k).strip(): str(v).strip()
+        for k, v in (manual_addresses or {}).items()
+        if str(k).strip() and str(v).strip()
+    }
+    if manual_addresses:
+        log_print(f"[*] 界面手动修正地址：{len(manual_addresses)} 条")
 
     port = instance_config["port"]
     profile_dir = instance_config["profile_dir"]
     cookie_file = instance_config["cookie_file"]
+    # 风控等待时用于从本实例 Chrome 同步验证后的 Cookie
+    _ACTIVE_PORT = port
+    _OPENED_VERIFY_URLS.clear()
 
     login_success = login(qz_username, qz_password)
     if not login_success:
@@ -1439,18 +2070,71 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
         log_print("没有订单！")
         return
 
+    # 【关键】在雀手订单阶段就过滤掉 success.txt / fail.txt 里已处理过的订单：
+    # - 雀手接口不支持按排除名单查询，只能在拿到列表后立即过滤；
+    # - 过滤后如果一条不剩，直接结束本次执行，不再查询供应商地址、
+    #   不再启动浏览器、不调用任何淘宝接口，避免无意义的接口请求和风控风险。
+    manual_tids = set(manual_addresses.keys())
+    fetched_tids = {str(row.get("tid", "")).strip() for row in all_orders}
+    unmatched_manual_tids = manual_tids - fetched_tids
+    if unmatched_manual_tids:
+        log_print(f"[!] 以下手动修正订单号不在本次雀手查询结果中（本次未生效）："
+                  f"{','.join(sorted(unmatched_manual_tids))}")
+    raw_order_count = len(all_orders)
+    # 手动修正地址的订单即使已在历史记录中，也强制重试（否则界面输入没有意义）
+    all_orders = [
+        row for row in all_orders
+        if str(row.get("tid", "")).strip() not in filtered_tids
+        or str(row.get("tid", "")).strip() in manual_tids
+    ]
+    filtered_count = raw_order_count - len(all_orders)
+    forced_tids = {
+        str(row.get("tid", "")).strip() for row in all_orders
+        if str(row.get("tid", "")).strip() in filtered_tids
+        and str(row.get("tid", "")).strip() in manual_tids
+    }
+    if forced_tids:
+        log_print(f"[*] 其中 {len(forced_tids)} 个订单因手动修正地址而强制重试"
+                  f"（忽略历史记录）")
+    if filtered_count:
+        log_print(f"[*] 已过滤历史记录订单 {filtered_count} 个，"
+                  f"剩余待处理 {len(all_orders)} 个")
+    if not all_orders:
+        log_print("[*] 没有需要处理的新订单，本次直接结束"
+                  "（不启动浏览器、不调用淘宝接口）")
+        return
+
+    # 打印本次真正待处理的订单号，便于核对
+    remaining_tids = []
+    seen_remaining = set()
+    for row in all_orders:
+        t = str(row.get("tid", "")).strip()
+        if t and t not in seen_remaining:
+            seen_remaining.add(t)
+            remaining_tids.append(t)
+    log_print(f"[*] 本次待处理订单号（{len(remaining_tids)} 个）：")
+    for t in remaining_tids:
+        log_print(f"    {t}")
+
     new_orders = []
     targetShopIdList = []
     seen_shop_id = set()
+    skip_reasons = {}  # 订单号 -> 不符合条件的具体原因
 
     for row in all_orders:
         check_stop()
         tid = row.get("tid")
-        printOrder = row.get("printOrder", [])
+        tid_key = str(tid).strip()
+        printOrder = row.get("printOrder", []) or []
+        valid_count = 0
+        reasons = []
+        if not printOrder:
+            reasons.append("无 printOrder")
         for p_order in printOrder:
             check_stop()
             cgDanhao = p_order.get("cgDanhao")
             if not cgDanhao:
+                reasons.append("无 cgDanhao")
                 continue
             refund_info_address = p_order.get("refundInfoAddress")
             if refund_info_address and (refund_info_address is not None):
@@ -1460,13 +2144,16 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
                     "targetShopId": "",
                     "refund_address": refund_info_address,
                 })
+                valid_count += 1
                 continue
             targetShopId = p_order.get("targetShopId")
             if not targetShopId:
+                reasons.append("无 targetShopId 且无退款地址")
                 continue
             try:
                 targetShopId = int(targetShopId)
             except (ValueError, TypeError):
+                reasons.append("targetShopId 非法")
                 continue
 
             new_orders.append({
@@ -1474,12 +2161,26 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
                 "cgDanhao": cgDanhao,
                 "targetShopId": targetShopId,
             })
+            valid_count += 1
             if targetShopId not in seen_shop_id:
                 seen_shop_id.add(targetShopId)
                 targetShopIdList.append({
                     "targetShopId": targetShopId,
                     "plat": 4,
                 })
+        if valid_count == 0:
+            # 同一订单可能有多个 printOrder，原因去重后按出现顺序展示
+            uniq_reasons = []
+            for r in reasons:
+                if r not in uniq_reasons:
+                    uniq_reasons.append(r)
+            skip_reasons[tid_key] = "；".join(uniq_reasons) if uniq_reasons else "无有效明细"
+
+    if skip_reasons:
+        log_print("[*] 不符合条件的订单及原因：")
+        for t in remaining_tids:
+            if t in skip_reasons:
+                log_print(f"    {t}：{skip_reasons[t]}")
 
     if not new_orders:
         log_print("没有符合条件的订单！")
@@ -1660,13 +2361,15 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
 
             log_print("\n" + "=" * 65)
             log_print("  ⚠️ 重要：请手动依次完成【滑块验证 + 短信验证码】全部校验！")
-            log_print(f"  持续监测登录状态，最长总等待时长 {MAX_WAIT} 秒")
+            log_print("  程序会一直等待，不会超时；验证完成后自动继续。")
+            log_print("  如需终止任务，请点击界面上的【停止执行】。")
             log_print("=" * 65 + "\n")
 
             logged_in = False
             start_time = time.time()
             last_tip = ""
-            while time.time() - start_time < MAX_WAIT:
+            last_remind = 0
+            while True:
                 check_stop()
                 is_login_success, msg = is_logged_in(page)
                 if is_login_success:
@@ -1681,16 +2384,11 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
                     last_tip = msg
 
                 elapsed_sec = int(time.time() - start_time)
-                if elapsed_sec % 10 == 0:
-                    log_print(f"    已等待 {elapsed_sec} / {MAX_WAIT} 秒，请完成滑块、短信验证码")
+                if elapsed_sec - last_remind >= 30:
+                    log_print(f"    已等待 {elapsed_sec} 秒，请完成滑块、短信验证码；"
+                              f"程序会一直等待（不会超时）")
+                    last_remind = elapsed_sec
                 safe_sleep(2)
-
-            if not logged_in:
-                log_print("\n[!] ❌ 登录等待超时！请检查是否完成全部验证")
-                log_print(f"[*] 当前页面URL: {page.url}")
-                log_print(f"[*] 当前页面标题: {page.title()}")
-                log_print(f"[*] 是否仍然存在登录框: {is_still_on_login_page(page)}")
-                return
 
         cookies = context.cookies()
         unique_cookies = get_unique_cookies(cookies)
@@ -1712,6 +2410,7 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
     # 加载淘宝 Cookie 到全局 session，后续淘宝 API 调用统一使用
     session.cookies.clear()
     session.cookies.update(cookie_jar)
+    _ACTIVE_COOKIE_JAR = cookie_jar
     log_print(f"[*] 已加载 Cookie，Session 中共有 {len(session.cookies)} 条")
 
     mode_text = "【覆盖第3条地址】" if RUN_MODE == 0 else "【每条订单新建独立地址】"
@@ -1721,43 +2420,47 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
     total = len(ORDERS)
     success_count = 0
     fail_count = 0
-    wait_orders = []
     res_orders = []
+
+    # 先收集本次需要查询的订单号（去重），再批量查询 + 缺失订单号逐个补查
+    query_tids = []
+    seen_query_tids = set()
     for idx, order in enumerate(ORDERS):
         check_stop()
-        tid = order["tid"]
+        tid = str(order["tid"]).strip()
 
-        if str(tid) in filtered_tids:
+        # 手动修正地址的订单强制重试，不因历史记录跳过
+        if tid in filtered_tids and tid not in manual_tids:
             log_print(f"\n{'=' * 70}")
             log_print(f"[{idx}/{total}] 订单 tid={tid} 已在历史记录中，跳过")
             continue
 
         log_print(f"\n{'=' * 70}")
         log_print(f"[{idx}/{total}] 处理订单 tid={tid}")
-        wait_orders.append(order)
-        if len(wait_orders) == 15:
-            tids = [str(order["tid"]) for order in wait_orders]
-            tids_str = ",".join(tids)
-            log_print("    [*] 正在批量查询订单...")
-            order_info = query_order_by_tid(session, tids_str)
-            wait_orders = []
-            if order_info:
-                res_orders.extend(order_info.get("mainOrders", []))
-    if wait_orders:
-        tids = [str(order["tid"]) for order in wait_orders]
-        tids_str = ",".join(tids)
-        log_print("    [*] 批量查询订单...")
-        order_info = query_order_by_tid(session, tids_str)
-        wait_orders = []
-        if order_info:
-            res_orders.extend(order_info.get("mainOrders", []))
+        if tid not in seen_query_tids:
+            seen_query_tids.add(tid)
+            query_tids.append(tid)
+
+    if query_tids:
+        log_print(f"\n[*] 本次待查询订单号共 {len(query_tids)} 个（已去重），开始批量查询...")
+        found_map, still_missing = query_orders_with_fallback(session, query_tids)
+        res_orders = list(found_map.values())
+    else:
+        log_print("\n[*] 本次没有需要查询的订单号")
+        still_missing = []
 
     for idx, order in enumerate(ORDERS):
         check_stop()
         tid = order["tid"]
-        if str(tid) in filtered_tids:
+        tid_key = str(tid).strip()
+        # 手动修正地址的订单即使已在历史记录中，也允许重新处理
+        if tid_key in filtered_tids and tid_key not in manual_tids:
             continue
         refund_address = order["refund_address"]
+        manual_addr = manual_addresses.get(tid_key)
+        if manual_addr:
+            log_print(f"    [*] 使用界面手动修正地址：{manual_addr}")
+            refund_address = manual_addr
         matched = False
         for main_order in res_orders:
             check_stop()
@@ -1879,7 +2582,7 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
             }
             log_print(f"修改订单地址请求体：{data_content}")
 
-            run_ok = update_order_address(
+            run_ok, mtop_reason = update_order_address(
                 session,
                 cookie_jar,
                 json.dumps(data_content, ensure_ascii=False),
@@ -1894,9 +2597,10 @@ def run_main_process(qz_username: str, qz_password: str, qn_username: str, qn_pa
             #     append_order_record(FAIL_FILE, tid, qn_username, reason='订单地址修改失败')
             # safe_sleep(0.8)
             if not run_ok:
-                log_print(f"    [!] ❌ 订单 {tid} mtop接口调用失败")
+                log_print(f"    [!] ❌ 订单 {tid} mtop接口调用失败：{mtop_reason}")
                 fail_count += 1
-                append_order_record(FAIL_FILE, tid, qn_username, reason='订单地址修改失败(mtop返回非成功)')
+                append_order_record(FAIL_FILE, tid, qn_username,
+                                    reason=f'订单地址修改失败:{mtop_reason}')
                 safe_sleep(0.8)
                 continue
 
@@ -2014,6 +2718,17 @@ class App:
         self.start_btn.pack(side=tk.LEFT, padx=5)
         self.stop_btn = ttk.Button(btn_frame, text="停止执行", command=self.stop_task, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(
+            input_frame,
+            text="手动修正地址（每行：订单号 修正后的地址；订单号与地址之间用空格分隔）:",
+            font=("Arial", 9, "bold"),
+        ).grid(row=6, column=0, columnspan=6, sticky=tk.W, pady=(8, 2))
+        self.manual_addr_text = scrolledtext.ScrolledText(
+            input_frame, height=4, wrap=tk.WORD
+        )
+        self.manual_addr_text.grid(row=7, column=0, columnspan=6,
+                                   sticky="ew", padx=5, pady=(0, 4))
 
         now = datetime.now()
         default_start = (now - timedelta(days=15)).strftime("%Y-%m-%d")
@@ -2236,12 +2951,16 @@ class App:
         end_date = f"{ui_end_date} 23:59"
 
         filtered_tids = get_filtered_tids()
+        # 读取界面里的手动修正地址（每行：订单号 修正后的地址）
+        manual_addresses = parse_manual_addresses(
+            self.manual_addr_text.get("1.0", tk.END)
+        )
         log_print(f"\n[*] 当前已处理订单过滤数: {len(filtered_tids)}")
         log_print(f"[*] 本次查询日期范围: {start_date} ~ {end_date}")
 
         run_main_process(qz_username, qz_password, qn_username, qn_password,
                          filtered_tids, start_date, end_date, self.instance_config,
-                         qz_shop_name)
+                         qz_shop_name, manual_addresses)
 
         cleanup_old_records(SUCCESS_FILE)
         cleanup_old_records(FAIL_FILE)
